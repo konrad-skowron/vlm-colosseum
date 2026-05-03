@@ -54,6 +54,7 @@ class SnapshotLoopConfig:
 def create_snapshot_loop(
     output_dir: Path | str = "captures",
     interval_seconds: float = 0.5,
+    extra_lua: str = "",
 ) -> SnapshotLoopConfig:
     """Prepare a MAME Lua script that saves a snapshot at a fixed interval."""
     if interval_seconds <= 0:
@@ -65,6 +66,8 @@ def create_snapshot_loop(
     script_contents = SNAPSHOT_LUA_TEMPLATE.format(
         interval_seconds=repr(interval_seconds),
     )
+    if extra_lua.strip():
+        script_contents = script_contents + "\n" + extra_lua.strip() + "\n"
     script_path = Path(tempfile.gettempdir()) / "mame_snapshot_loop.lua"
     script_path.write_text(script_contents, encoding="utf-8")
 
