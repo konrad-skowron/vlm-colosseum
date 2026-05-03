@@ -41,7 +41,7 @@ class SnapshotLoopConfig:
             "-snapshot_directory",
             str(self.output_dir),
             "-snapname",
-            "frame_%i",
+            "latest_frame",
             "-snapview",
             "native",
         ]
@@ -53,7 +53,7 @@ class SnapshotLoopConfig:
 
 def create_snapshot_loop(
     output_dir: Path | str = "captures",
-    interval_seconds: float = 1.0,
+    interval_seconds: float = 0.5,
 ) -> SnapshotLoopConfig:
     """Prepare a MAME Lua script that saves a snapshot at a fixed interval."""
     if interval_seconds <= 0:

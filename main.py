@@ -1,5 +1,5 @@
 from mame_launcher import open_sfiii3n
-from screenshot_loop import create_snapshot_loop, delete_screenshots
+from screenshot_loop import create_snapshot_loop
 
 
 def main() -> None:
@@ -12,7 +12,6 @@ def main() -> None:
         process.terminate()
         process.wait()
     finally:
-        delete_screenshots(snapshot_loop.output_dir)
         snapshot_loop.cleanup()
 
 
