@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 from urllib import error, request
 
 from fight_starter import (
@@ -92,6 +92,7 @@ class ArenaConfig:
     model_p2: str
     api_key: str
     round_start_buffer_seconds: float
+    screenshot_warmup_updates: int
     screenshot_path: Path = SCREENSHOT_PATH
     command_path_p1: Path = COMMAND_PATH_P1
     command_path_p2: Path = COMMAND_PATH_P2
@@ -109,6 +110,9 @@ class ParsedMove:
 class ParsedStep:
     tokens: list[str]
     hold_frames: int
+
+
+LogFn = Callable[[str, str], None]
 
 
 def load_dotenv(dotenv_path: Path = Path(".env")) -> None:
@@ -129,6 +133,13 @@ def load_dotenv(dotenv_path: Path = Path(".env")) -> None:
 
 def _lua_path(path: Path) -> str:
     return path.resolve().as_posix()
+
+
+def _emit_log(log_fn: LogFn | None, channel: str, message: str) -> None:
+    if log_fn is not None:
+        log_fn(channel, message)
+    else:
+        print(message)
 
 
 def build_move_bridge_lua(command_path_p1: Path, command_path_p2: Path) -> str:
@@ -527,6 +538,7 @@ def build_arena_config(
     fight_start: FightStartConfig | None = None,
     captures_dir: Path = CAPTURES_DIR,
     round_start_buffer_seconds: float = 6.0,
+    screenshot_warmup_updates: int = 3,
 ) -> ArenaConfig:
     return ArenaConfig(
         fight_start=fight_start or FightStartConfig(),
@@ -534,6 +546,7 @@ def build_arena_config(
         model_p2=_require_env("OPENROUTER_MODEL_P2"),
         api_key=_require_env("OPENROUTER_API_KEY"),
         round_start_buffer_seconds=round_start_buffer_seconds,
+        screenshot_warmup_updates=screenshot_warmup_updates,
         captures_dir=captures_dir,
         screenshot_path=captures_dir / "latest_frame.png",
         command_path_p1=captures_dir / "llm_moves_p1.txt",
@@ -554,12 +567,16 @@ def initialize_command_files(config: ArenaConfig) -> None:
     )
 
 
-def wait_for_fight_start(config: ArenaConfig) -> None:
+def wait_for_fight_start(config: ArenaConfig, log_fn: LogFn | None = None) -> None:
     final_frame = estimate_fight_start_frame(config.fight_start)
     delay_seconds = (
         final_frame / DEFAULT_FPS
     ) + config.round_start_buffer_seconds
-    print(f"Waiting {delay_seconds:.1f}s for fight start sequence to finish.")
+    _emit_log(
+        log_fn,
+        "status",
+        f"Waiting {delay_seconds:.1f}s for fight start sequence to finish.",
+    )
     time.sleep(delay_seconds)
 
 
@@ -568,6 +585,43 @@ def wait_for_screenshot_exists(path: Path) -> None:
         if path.exists():
             return
         time.sleep(0.1)
+
+
+def wait_for_screenshot_warmup(
+    path: Path,
+    update_count: int,
+    log_fn: LogFn | None = None,
+) -> None:
+    if update_count <= 0:
+        return
+
+    wait_for_screenshot_exists(path)
+    last_mtime_ns = path.stat().st_mtime_ns
+    seen_updates = 0
+
+    _emit_log(
+        log_fn,
+        "status",
+        "Waiting for "
+        f"{update_count} fresh screenshot update(s) before starting LLM workers.",
+    )
+
+    while seen_updates < update_count:
+        time.sleep(0.1)
+        try:
+            current_mtime_ns = path.stat().st_mtime_ns
+        except FileNotFoundError:
+            continue
+
+        if current_mtime_ns != last_mtime_ns:
+            last_mtime_ns = current_mtime_ns
+            seen_updates += 1
+            _emit_log(
+                log_fn,
+                "status",
+                "Observed screenshot warmup update "
+                f"{seen_updates}/{update_count}.",
+            )
 
 
 def llm_worker(
@@ -579,24 +633,36 @@ def llm_worker(
     command_path: Path,
     player_number: int,
     poll_seconds: float,
+    log_fn: LogFn | None = None,
 ) -> None:
     command_id = 0
-    print(f"P{player_number} worker starting for model {model}")
+    channel = f"p{player_number}"
+    _emit_log(log_fn, channel, f"worker starting for model {model}")
     wait_for_screenshot_exists(screenshot_path)
-    print(f"P{player_number} worker found screenshot source at {screenshot_path}")
+    _emit_log(
+        log_fn,
+        channel,
+        f"worker found screenshot source at {screenshot_path}",
+    )
 
     while not stop_event.is_set():
         try:
-            print(f"P{player_number} requesting next move from {model}")
+            _emit_log(
+                log_fn,
+                channel,
+                f"requesting next move from {model}",
+            )
             player_move = call_openrouter_model(
                 api_key=api_key,
                 model=model,
                 screenshot_path=screenshot_path,
                 player_number=player_number,
             )
-            print(
-                f"P{player_number} {model}: {_steps_to_command_line(player_move)}"
-                + (f" | {player_move.summary}" if player_move.summary else "")
+            _emit_log(
+                log_fn,
+                channel,
+                f"{model}: {_steps_to_command_line(player_move)}"
+                + (f" | {player_move.summary}" if player_move.summary else ""),
             )
 
             command_id += 1
@@ -605,11 +671,13 @@ def llm_worker(
                 command_id=command_id,
                 player_move=player_move,
             )
-            print(
-                f"Wrote P{player_number} command {command_id} to {command_path}"
+            _emit_log(
+                log_fn,
+                channel,
+                f"Wrote command {command_id} to {command_path}",
             )
         except Exception as exc:
-            print(f"P{player_number} worker error: {exc}")
+            _emit_log(log_fn, channel, f"worker error: {exc}")
             if stop_event.wait(REQUEST_RETRY_SECONDS):
                 return
             continue
@@ -625,6 +693,7 @@ def llm_worker(
 def start_llm_workers(
     config: ArenaConfig,
     stop_event: threading.Event,
+    log_fn: LogFn | None = None,
 ) -> list[threading.Thread]:
     workers = [
         threading.Thread(
@@ -637,6 +706,7 @@ def start_llm_workers(
                 "command_path": config.command_path_p1,
                 "player_number": 1,
                 "poll_seconds": config.poll_seconds,
+                "log_fn": log_fn,
             },
             daemon=True,
             name="llm-p1",
@@ -651,6 +721,7 @@ def start_llm_workers(
                 "command_path": config.command_path_p2,
                 "player_number": 2,
                 "poll_seconds": config.poll_seconds,
+                "log_fn": log_fn,
             },
             daemon=True,
             name="llm-p2",
