@@ -187,6 +187,13 @@ def _build_schedule(config: FightStartConfig) -> list[tuple[int, str, int]]:
     return schedule
 
 
+def estimate_fight_start_frame(config: FightStartConfig | None = None) -> int:
+    """Return the last scheduled fight-start frame."""
+    config = config or FightStartConfig()
+    schedule = _build_schedule(config)
+    return max((start_frame + duration_frames) for start_frame, _, duration_frames in schedule)
+
+
 def build_fight_start_lua(config: FightStartConfig | None = None) -> str:
     """Build Lua that inserts a coin, starts 2P, and confirms both selections."""
     config = config or FightStartConfig()
@@ -247,13 +254,13 @@ fight_start_subscription = emu.add_machine_frame_notifier(function ()
                     if not fight_start_resolved[step.token] then
                         fight_start_resolved[step.token] = true
                         emu.print_info(
-                            "resolved " .. step.token ..
+                            "fight_start: resolved " .. step.token ..
                             " on frame " .. tostring(fight_start_frame)
                         )
                     end
                 elseif not fight_start_missing[step.token] then
                     fight_start_missing[step.token] = true
-                    emu.print_error("missing input token " .. step.token)
+                    emu.print_error("fight_start: missing input token " .. step.token)
                 end
             end
 
@@ -261,7 +268,7 @@ fight_start_subscription = emu.add_machine_frame_notifier(function ()
                 next_active[step.token] = step.field
                 if not fight_start_active[step.token] then
                     emu.print_info(
-                        "press " .. step.token ..
+                        "fight_start: press " .. step.token ..
                         " on frame " .. tostring(fight_start_frame)
                     )
                 end
@@ -276,7 +283,7 @@ fight_start_subscription = emu.add_machine_frame_notifier(function ()
     for token, field in pairs(fight_start_active) do
         if not next_active[token] then
             emu.print_info(
-                "release " .. token ..
+                "fight_start: release " .. token ..
                 " on frame " .. tostring(fight_start_frame)
             )
             field:clear_value()
