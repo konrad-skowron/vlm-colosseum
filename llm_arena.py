@@ -1,22 +1,20 @@
 from __future__ import annotations
 
-from base64 import b64encode
-from dataclasses import dataclass
 import json
 import os
-from pathlib import Path
 import re
 import threading
 import time
+from base64 import b64encode
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 from urllib import error, request
 
 from fight_starter import (
     FightStartConfig,
-    build_fight_start_lua,
     estimate_fight_start_frame,
 )
-
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 CAPTURES_DIR = Path("captures")
@@ -74,6 +72,9 @@ Rules:
 - each step must include hold_frames from 1 to 60
 - simultaneous inputs go in the same step
 - sequential inputs go in separate steps
+- your objective is to win the round
+- choose the move sequence you believe best improves your chance to win
+- do not force a fixed style such as always attacking, always retreating, or always waiting
 - use larger hold_frames when you want to keep holding a direction or button
 - if no useful action is clear, return {"steps":[{"tokens":["NONE"],"hold_frames":4}],"summary":"..."}
 - do not add markdown
@@ -81,6 +82,7 @@ Rules:
 
 PLAYER_PROMPT_TEMPLATE = """You are Player {player_number}.
 Choose the next short input sequence for Player {player_number} only.
+Play to win using your own judgment.
 Keep it brief and usually executable in under one second.
 """
 
@@ -334,7 +336,7 @@ end)
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:
-    match = re.search(r"\{.*\}", text, re.DOTALL)
+    match = re.search(r"\{.*}", text, re.DOTALL)
     if not match:
         raise ValueError("No JSON object found in model response")
     data = json.loads(match.group(0))
