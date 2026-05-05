@@ -21,35 +21,39 @@ MOVE_TOKENS = {
 
 CHARACTER_ORDER = (
     "alex",
-    "sean",
-    "ibuki",
-    "necro",
-    "urien",
-    "akuma",
-    "yang",
     "twelve",
-    "makoto",
-    "chun_li",
-    "q",
-    "remy",
-    "yun",
-    "ken",
     "hugo",
+    "sean",
+    "makoto",
     "elena",
+    "ibuki",
+    "chun_li",
     "dudley",
+    "necro",
+    "q",
     "oro",
+    "urien",
+    "remy",
     "ryu",
+    "akuma",
+    "yun",
+    "yang",
+    "ken",
 )
 
 CHARACTER_ALIASES = {
     "chunli": "chun_li",
     "chun-li": "chun_li",
     "gouki": "akuma",
+    "qouky": "akuma",
 }
 
-CHARACTER_MOVE_MAP = {
-    character_name: ("right",) * index
-    for index, character_name in enumerate(CHARACTER_ORDER)
+CHARACTER_INDEX_BY_NAME = {
+    character_name: index for index, character_name in enumerate(CHARACTER_ORDER)
+}
+CURSOR_START_CHARACTER = {
+    "P1": "alex",
+    "P2": "ryu",
 }
 
 
@@ -70,14 +74,20 @@ def _normalize_character_name(character_name: str) -> str:
 
 def _moves_for_character(character_name: str, player_label: str) -> tuple[str, ...]:
     normalized = _normalize_character_name(character_name)
+    normalized_player_label = player_label.strip().upper()
     try:
-        return CHARACTER_MOVE_MAP[normalized]
+        target_index = CHARACTER_INDEX_BY_NAME[normalized]
     except KeyError as exc:
         supported = ", ".join(CHARACTER_ORDER)
         raise ValueError(
             f"{player_label} character '{character_name}' is unsupported. "
             f"Supported characters: {supported}"
         ) from exc
+
+    cursor_start_name = CURSOR_START_CHARACTER.get(normalized_player_label, CHARACTER_ORDER[0])
+    start_index = CHARACTER_INDEX_BY_NAME[cursor_start_name]
+    right_moves = (target_index - start_index) % len(CHARACTER_ORDER)
+    return ("right",) * right_moves
 
 
 def _validate_moves(moves: tuple[str, ...], player_label: str) -> None:
@@ -105,7 +115,11 @@ def _build_player_schedule(
 
     for move in moves:
         schedule.append(
-            (current_frame, token_prefix + MOVE_TOKENS[move], PRESS_FRAMES)
+            (
+                current_frame,
+                token_prefix + MOVE_TOKENS[move],
+                PRESS_FRAMES,
+            )
         )
         current_frame += PRESS_FRAMES + BETWEEN_PLAYER_ACTIONS_FRAMES
 
