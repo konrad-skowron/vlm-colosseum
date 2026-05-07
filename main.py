@@ -19,14 +19,14 @@ from screenshot_loop import create_snapshot_loop
 ENABLE_LLM_ARENA = True
 ENABLE_LOG_WINDOW = True
 CAPTURES_DIR = "captures"
-LLM_ROUND_START_BUFFER_SECONDS = 10.0
+LLM_ROUND_START_BUFFER_SECONDS = 15.0
 LLM_SCREENSHOT_WARMUP_UPDATES = 4
 
 
 def main() -> None:
     fight_start = FightStartConfig(
-        p1_character=None,
-        p2_character=None,
+        p1_character='dudley',
+        p2_character='dudley',
         p1_super_art=1,
         p2_super_art=1,
     )
