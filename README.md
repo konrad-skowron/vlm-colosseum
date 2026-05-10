@@ -65,16 +65,10 @@ python .\main.py
 Main runtime flags are near the top of `main.py`:
 
 ```python
-ENABLE_LLM_ARENA = True
-ENABLE_LOG_WINDOW = True
-CAPTURES_DIR = "captures"
 EXPERIMENT_MATCH_COUNT = 1
 MATCH_MAX_SECONDS = 230.0
 AI_PLAYERS = (1, 2)
 USE_ON_DEMAND_SCREENSHOTS = True
-MAME_WINDOW_ARGS = []
-LLM_ROUND_START_BUFFER_SECONDS = 12.0
-LLM_SCREENSHOT_WARMUP_UPDATES = 4
 ```
 
 Meaning:
@@ -90,9 +84,6 @@ Meaning:
 
 - `USE_ON_DEMAND_SCREENSHOTS`  
   If `True`, MAME takes a fresh screenshot only when a model worker is about to send a request. This is preferred for experiments because it reduces stale observations and unnecessary disk writes.
-
-- `MAME_WINDOW_ARGS`  
-  Optional extra MAME display arguments. Empty by default, so MAME uses its configured window behavior.
 
 ## AI Player Modes
 
