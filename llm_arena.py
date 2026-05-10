@@ -26,10 +26,12 @@ COMMAND_PATH_P1 = CAPTURES_DIR / "llm_moves_p1.txt"
 COMMAND_PATH_P2 = CAPTURES_DIR / "llm_moves_p2.txt"
 FIGHT_LOG_PATH = CAPTURES_DIR / "fight_log.csv"
 MATCH_STATE_PATH = CAPTURES_DIR / "match_state.json"
+SNAPSHOT_REQUEST_PATH = CAPTURES_DIR / "snapshot_request.txt"
 DEFAULT_FPS = 60.0
 POLL_SECONDS = 1.5
 REQUEST_TIMEOUT_SECONDS = 45.0
 REQUEST_RETRY_SECONDS = 1.0
+SNAPSHOT_REQUEST_TIMEOUT_SECONDS = 2.0
 STEP_PRESS_FRAMES = 4
 STEP_GAP_FRAMES = 1
 MAX_STEPS = 16
@@ -39,6 +41,7 @@ SCREENSHOT_READ_RETRIES = 20
 SCREENSHOT_READ_RETRY_SECONDS = 0.05
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 PNG_IEND_CHUNK = b"\x00\x00\x00\x00IEND\xaeB`\x82"
+_SNAPSHOT_REQUEST_LOCK = threading.Lock()
 
 ALLOWED_MOVE_TOKENS = (
     "UP",
@@ -53,6 +56,19 @@ ALLOWED_MOVE_TOKENS = (
     "HK",
     "NONE",
 )
+
+TOKEN_ALIASES = {
+    "LIGHT_PUNCH": "LP",
+    "MEDIUM_PUNCH": "MP",
+    "HEAVY_PUNCH": "HP",
+    "LIGHT_KICK": "LK",
+    "MEDIUM_KICK": "MK",
+    "HEAVY_KICK": "HK",
+    "PUNCH": "HP",
+    "KICK": "HK",
+    "NO_INPUT": "NONE",
+    "WAIT": "NONE",
+}
 
 TOKEN_TO_MAME_SUFFIX = {
     "UP": "JOYSTICK_UP",
@@ -364,9 +380,11 @@ SUPER_ART_GUIDE = {
 
 SYSTEM_PROMPT = """You control one player in Street Fighter III: 3rd Strike.
 You receive one gameplay screenshot and must output only the next controller input sequence.
+Track your own character by Player number and visual identity, especially character color, not by screen side alone. Characters can switch sides after jumps, throws, cross-ups, or Super Arts.
 
-Return exactly one JSON object and nothing else:
-{"steps":[{"tokens":["TOKEN"],"hold_frames":4}]}
+Return exactly one JSON object and nothing else.
+Example valid response:
+{"steps":[{"tokens":["RIGHT"],"hold_frames":4}]}
 
 Controller tokens:
 - UP, DOWN, LEFT, RIGHT are joystick directions.
@@ -389,8 +407,9 @@ Input rules:
 - steps are executed in order, so use multiple steps for combos, motions, cancels, blocks, movement, or attacks.
 - hold_frames is how long to hold all tokens in that step; use larger values to keep holding a direction or button.
 - LEFT and RIGHT are physical joystick directions, not semantic forward/back. Infer forward, backward, and blocking direction from the screenshot.
+- Never output placeholder values such as TOKEN, FORWARD, or BACK. Convert every direction to UP, DOWN, LEFT, or RIGHT.
 - Special moves and Super Arts are input as ordered direction/button steps, e.g. quarter-circle motions followed by punch or kick.
-- Use Super Art when you judge it likely to connect or strategically useful; do not waste it if the situation is poor.
+- After a side switch, re-identify which visible character is yours before choosing directions. Do not assume you are still on the same side as in the previous screenshot.
 - If no useful action is clear, return {"steps":[{"tokens":["NONE"],"hold_frames":4}]}.
 - Do not include explanations, summaries, markdown, comments, or any text outside the JSON object.
 
@@ -398,6 +417,7 @@ Choose whatever tactic and input sequence you judge most likely to win the round
 """
 
 PLAYER_PROMPT_TEMPLATE = """You are Player {player_number}.
+Identify Player {player_number}'s character visually before acting, including color and current side.
 Choose only the next short input sequence for Player {player_number}.
 """
 
@@ -411,11 +431,13 @@ class ArenaConfig:
     round_start_buffer_seconds: float
     screenshot_warmup_updates: int
     screenshot_path: Path = SCREENSHOT_PATH
+    snapshot_request_path: Path | None = None
     command_path_p1: Path = COMMAND_PATH_P1
     command_path_p2: Path = COMMAND_PATH_P2
     captures_dir: Path = CAPTURES_DIR
     poll_seconds: float = POLL_SECONDS
     use_action_history: bool = False
+    ai_players: tuple[int, ...] = (1, 2)
 
 
 @dataclass(slots=True)
@@ -873,23 +895,37 @@ def _extract_json_object(text: str) -> dict[str, Any]:
 
 
 def _normalize_tokens(raw_tokens: Any) -> list[str]:
+    if isinstance(raw_tokens, str):
+        raw_tokens = [raw_tokens]
     if not isinstance(raw_tokens, list):
-        raise ValueError("step tokens must be a list")
+        raise ValueError("step tokens must be a list or string")
 
     normalized_tokens: list[str] = []
-    for raw_token in raw_tokens[:MAX_TOKENS_PER_STEP]:
+    seen_tokens: set[str] = set()
+    for raw_token in raw_tokens:
         if not isinstance(raw_token, str):
             raise ValueError("each token must be a string")
-        token = raw_token.strip().upper().replace(" ", "_")
-        if token not in ALLOWED_MOVE_TOKENS:
-            raise ValueError(f"Unsupported move token: {token}")
-        if token != "NONE":
+        raw_parts = re.split(r"[+,/]", raw_token)
+        for raw_part in raw_parts:
+            token = raw_part.strip().upper().replace(" ", "_")
+            token = TOKEN_ALIASES.get(token, token)
+            if not token:
+                continue
+            if token not in ALLOWED_MOVE_TOKENS:
+                raise ValueError(f"Unsupported move token: {token}")
+            if token == "NONE" or token in seen_tokens:
+                continue
+            if len(normalized_tokens) >= MAX_TOKENS_PER_STEP:
+                return normalized_tokens
             normalized_tokens.append(token)
+            seen_tokens.add(token)
 
     return normalized_tokens
 
 
 def _normalize_hold_frames(raw_hold_frames: Any) -> int:
+    if isinstance(raw_hold_frames, str) and raw_hold_frames.strip().isdigit():
+        raw_hold_frames = int(raw_hold_frames.strip())
     if not isinstance(raw_hold_frames, int):
         raise ValueError("hold_frames must be an integer")
     if raw_hold_frames < 1 or raw_hold_frames > MAX_HOLD_FRAMES:
@@ -999,15 +1035,48 @@ def _encode_image_as_data_url(path: Path) -> str:
     return f"data:image/png;base64,{encoded}"
 
 
+def request_fresh_screenshot(
+    *,
+    screenshot_path: Path,
+    request_path: Path | None,
+) -> None:
+    if request_path is None:
+        return
+
+    with _SNAPSHOT_REQUEST_LOCK:
+        previous_mtime = screenshot_path.stat().st_mtime_ns if screenshot_path.exists() else None
+        request_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = request_path.with_suffix(".tmp")
+        request_id = str(time.time_ns())
+        temp_path.write_text(request_id, encoding="utf-8")
+        temp_path.replace(request_path)
+
+        deadline = time.perf_counter() + SNAPSHOT_REQUEST_TIMEOUT_SECONDS
+        while time.perf_counter() < deadline:
+            if screenshot_path.exists():
+                current_mtime = screenshot_path.stat().st_mtime_ns
+                if previous_mtime is None or current_mtime != previous_mtime:
+                    _read_screenshot_bytes(screenshot_path)
+                    return
+            time.sleep(SCREENSHOT_READ_RETRY_SECONDS)
+
+        raise TimeoutError(f"Timed out waiting for fresh screenshot: {screenshot_path}")
+
+
 def call_openrouter_model(
     *,
     api_key: str,
     model: str,
     screenshot_path: Path,
+    snapshot_request_path: Path | None,
     player_number: int,
     fight_start: FightStartConfig,
     action_history: Sequence[str] | None = None,
 ) -> ModelCallResult:
+    request_fresh_screenshot(
+        screenshot_path=screenshot_path,
+        request_path=snapshot_request_path,
+    )
     screenshot_url = _encode_image_as_data_url(screenshot_path)
     player_prompt = PLAYER_PROMPT_TEMPLATE.format(player_number=player_number)
     player_prompt += _super_art_context(fight_start, player_number)
@@ -1136,19 +1205,33 @@ def build_arena_config(
     round_start_buffer_seconds: float = 6.0,
     screenshot_warmup_updates: int = 3,
     use_action_history: bool = False,
+    snapshot_request_path: Path | None = None,
+    ai_players: Sequence[int] = (1, 2),
 ) -> ArenaConfig:
+    ai_player_set = set(ai_players)
+    normalized_ai_players = tuple(
+        player for player in (1, 2) if player in ai_player_set
+    )
+    if not normalized_ai_players:
+        raise ValueError("At least one AI player must be enabled.")
+
+    model_p1 = _require_env("OPENROUTER_MODEL_P1") if 1 in normalized_ai_players else ""
+    model_p2 = _require_env("OPENROUTER_MODEL_P2") if 2 in normalized_ai_players else ""
+
     return ArenaConfig(
         fight_start=fight_start or FightStartConfig(),
-        model_p1=_require_env("OPENROUTER_MODEL_P1"),
-        model_p2=_require_env("OPENROUTER_MODEL_P2"),
+        model_p1=model_p1,
+        model_p2=model_p2,
         api_key=_require_env("OPENROUTER_API_KEY"),
         round_start_buffer_seconds=round_start_buffer_seconds,
         screenshot_warmup_updates=screenshot_warmup_updates,
         captures_dir=captures_dir,
         screenshot_path=captures_dir / "latest_frame.png",
+        snapshot_request_path=snapshot_request_path,
         command_path_p1=captures_dir / "llm_moves_p1.txt",
         command_path_p2=captures_dir / "llm_moves_p2.txt",
         use_action_history=use_action_history,
+        ai_players=normalized_ai_players,
     )
 
 
@@ -1228,6 +1311,7 @@ def llm_worker(
     api_key: str,
     model: str,
     screenshot_path: Path,
+    snapshot_request_path: Path | None,
     command_path: Path,
     player_number: int,
     poll_seconds: float,
@@ -1259,6 +1343,7 @@ def llm_worker(
                 api_key=api_key,
                 model=model,
                 screenshot_path=screenshot_path,
+                snapshot_request_path=snapshot_request_path,
                 player_number=player_number,
                 fight_start=fight_start,
                 action_history=list(recent_actions) if use_action_history else None,
@@ -1323,14 +1408,17 @@ def start_llm_workers(
     log_fn: LogFn | None = None,
 ) -> list[threading.Thread]:
     experiment_logger = ExperimentLogger(config.captures_dir / "fight_log.csv")
-    workers = [
-        threading.Thread(
+    workers: list[threading.Thread] = []
+
+    if 1 in config.ai_players:
+        workers.append(threading.Thread(
             target=llm_worker,
             kwargs={
                 "stop_event": stop_event,
                 "api_key": config.api_key,
                 "model": config.model_p1,
                 "screenshot_path": config.screenshot_path,
+                "snapshot_request_path": config.snapshot_request_path,
                 "command_path": config.command_path_p1,
                 "player_number": 1,
                 "poll_seconds": config.poll_seconds,
@@ -1341,14 +1429,17 @@ def start_llm_workers(
             },
             daemon=True,
             name="llm-p1",
-        ),
-        threading.Thread(
+        ))
+
+    if 2 in config.ai_players:
+        workers.append(threading.Thread(
             target=llm_worker,
             kwargs={
                 "stop_event": stop_event,
                 "api_key": config.api_key,
                 "model": config.model_p2,
                 "screenshot_path": config.screenshot_path,
+                "snapshot_request_path": config.snapshot_request_path,
                 "command_path": config.command_path_p2,
                 "player_number": 2,
                 "poll_seconds": config.poll_seconds,
@@ -1359,8 +1450,7 @@ def start_llm_workers(
             },
             daemon=True,
             name="llm-p2",
-        ),
-    ]
+        ))
 
     for worker in workers:
         worker.start()

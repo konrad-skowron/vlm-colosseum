@@ -65,6 +65,7 @@ class FightStartConfig:
     p2_moves: tuple[str, ...] = ()
     p1_super_art: int = 1
     p2_super_art: int = 1
+    active_players: tuple[int, ...] = (1, 2)
 
 
 def _normalize_character_name(character_name: str) -> str:
@@ -103,6 +104,13 @@ def _validate_super_art(super_art: int, player_label: str) -> None:
         raise ValueError(f"{player_label} super art must be 1, 2, or 3")
 
 
+def _active_players(config: FightStartConfig) -> tuple[int, ...]:
+    players = tuple(player for player in (1, 2) if player in set(config.active_players))
+    if not players:
+        raise ValueError("At least one active player must be configured")
+    return players
+
+
 def _build_player_schedule(
     player_number: int,
     moves: tuple[str, ...],
@@ -134,6 +142,7 @@ def _build_player_schedule(
 
 
 def _build_schedule(config: FightStartConfig) -> list[tuple[int, str, int]]:
+    active_players = _active_players(config)
     p1_moves = (
         config.p1_moves
         if config.p1_moves
@@ -154,50 +163,39 @@ def _build_schedule(config: FightStartConfig) -> list[tuple[int, str, int]]:
     _validate_super_art(config.p1_super_art, "P1")
     _validate_super_art(config.p2_super_art, "P2")
 
-    schedule: list[tuple[int, str, int]] = [
-        (BOOT_WAIT_FRAMES, "COIN1", PRESS_FRAMES),
-        (
-            BOOT_WAIT_FRAMES + POST_COIN_WAIT_FRAMES,
-            "COIN1",
-            PRESS_FRAMES,
-        ),
-        (
-            BOOT_WAIT_FRAMES + POST_COIN_WAIT_FRAMES + SECOND_COIN_WAIT_FRAMES,
-            "START1",
-            PRESS_FRAMES,
-        ),
-        (
-            BOOT_WAIT_FRAMES
-            + POST_COIN_WAIT_FRAMES
-            + SECOND_COIN_WAIT_FRAMES
-            + BETWEEN_STARTS_WAIT_FRAMES,
-            "START2",
-            PRESS_FRAMES,
-        ),
-    ]
+    schedule: list[tuple[int, str, int]] = []
+    current_frame = BOOT_WAIT_FRAMES
 
-    selection_start = (
-        BOOT_WAIT_FRAMES
-        + POST_COIN_WAIT_FRAMES
-        + SECOND_COIN_WAIT_FRAMES
-        + BETWEEN_STARTS_WAIT_FRAMES
-        + POST_START_WAIT_FRAMES
-    )
-    p1_schedule, p1_end_frame = _build_player_schedule(
-        player_number=1,
-        moves=p1_moves,
-        super_art=config.p1_super_art,
-        start_frame=selection_start,
-    )
-    p2_schedule, _ = _build_player_schedule(
-        player_number=2,
-        moves=p2_moves,
-        super_art=config.p2_super_art,
-        start_frame=p1_end_frame + BETWEEN_PLAYER_ACTIONS_FRAMES,
-    )
+    schedule.append((current_frame, "COIN1", PRESS_FRAMES))
+    current_frame += POST_COIN_WAIT_FRAMES
+    schedule.append((current_frame, "COIN1", PRESS_FRAMES))
+    current_frame += SECOND_COIN_WAIT_FRAMES
 
-    schedule.extend(p1_schedule)
-    schedule.extend(p2_schedule)
+    for player in active_players:
+        schedule.append((current_frame, f"START{player}", PRESS_FRAMES))
+        current_frame += BETWEEN_STARTS_WAIT_FRAMES
+
+    current_frame += POST_START_WAIT_FRAMES
+
+    if 1 in active_players:
+        p1_schedule, current_frame = _build_player_schedule(
+            player_number=1,
+            moves=p1_moves,
+            super_art=config.p1_super_art,
+            start_frame=current_frame,
+        )
+        schedule.extend(p1_schedule)
+        current_frame += BETWEEN_PLAYER_ACTIONS_FRAMES
+
+    if 2 in active_players:
+        p2_schedule, current_frame = _build_player_schedule(
+            player_number=2,
+            moves=p2_moves,
+            super_art=config.p2_super_art,
+            start_frame=current_frame,
+        )
+        schedule.extend(p2_schedule)
+
     return schedule
 
 
@@ -209,7 +207,7 @@ def estimate_fight_start_frame(config: FightStartConfig | None = None) -> int:
 
 
 def build_fight_start_lua(config: FightStartConfig | None = None) -> str:
-    """Build Lua that inserts a coin, starts 2P, and confirms both selections."""
+    """Build Lua that inserts coins, starts active players, and confirms selections."""
     config = config or FightStartConfig()
     schedule_lines = []
 

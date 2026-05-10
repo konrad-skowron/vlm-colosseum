@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 
 
-SNAPSHOT_LUA_TEMPLATE = """local interval_seconds = {interval_seconds}
+SNAPSHOT_INTERVAL_LUA_TEMPLATE = """local interval_seconds = {interval_seconds}
 local next_snapshot_time = interval_seconds
 
 snapshot_frame_subscription = emu.add_machine_frame_notifier(function ()
@@ -26,11 +26,40 @@ snapshot_frame_subscription = emu.add_machine_frame_notifier(function ()
 end)
 """
 
+SNAPSHOT_ON_DEMAND_LUA_TEMPLATE = """local snapshot_request_path = "{request_path}"
+local snapshot_last_request_id = nil
+
+snapshot_frame_subscription = emu.add_machine_frame_notifier(function ()
+    if manager.machine.paused or manager.machine.exit_pending then
+        return
+    end
+
+    local file = io.open(snapshot_request_path, "r")
+    if file == nil then
+        return
+    end
+
+    local request_id = file:read("*l")
+    file:close()
+
+    if request_id == nil or request_id == "" then
+        return
+    end
+    if request_id == snapshot_last_request_id then
+        return
+    end
+
+    snapshot_last_request_id = request_id
+    manager.machine.video:snapshot()
+end)
+"""
+
 
 @dataclass(slots=True)
 class SnapshotLoopConfig:
     output_dir: Path
     script_path: Path
+    request_path: Path | None = None
 
     def mame_args(self) -> list[str]:
         return [
@@ -55,17 +84,26 @@ def create_snapshot_loop(
     output_dir: Path | str = "captures",
     interval_seconds: float = 0.5,
     extra_lua: str = "",
+    on_demand: bool = False,
 ) -> SnapshotLoopConfig:
-    """Prepare a MAME Lua script that saves a snapshot at a fixed interval."""
-    if interval_seconds <= 0:
+    """Prepare a MAME Lua script that saves snapshots."""
+    if not on_demand and interval_seconds <= 0:
         raise ValueError("interval_seconds must be greater than 0")
 
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    script_contents = SNAPSHOT_LUA_TEMPLATE.format(
-        interval_seconds=repr(interval_seconds),
-    )
+    request_path = output_dir / "snapshot_request.txt"
+    if on_demand:
+        request_path.write_text("", encoding="utf-8")
+        script_contents = SNAPSHOT_ON_DEMAND_LUA_TEMPLATE.format(
+            request_path=request_path.as_posix(),
+        )
+    else:
+        script_contents = SNAPSHOT_INTERVAL_LUA_TEMPLATE.format(
+            interval_seconds=repr(interval_seconds),
+        )
+
     if extra_lua.strip():
         script_contents = script_contents + "\n" + extra_lua.strip() + "\n"
     script_path = Path(tempfile.gettempdir()) / "mame_snapshot_loop.lua"
@@ -74,6 +112,7 @@ def create_snapshot_loop(
     return SnapshotLoopConfig(
         output_dir=output_dir,
         script_path=script_path,
+        request_path=request_path if on_demand else None,
     )
 
 

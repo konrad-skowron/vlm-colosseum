@@ -13,6 +13,7 @@ from llm_arena import (
     build_move_bridge_lua,
     initialize_command_files,
     load_dotenv,
+    request_fresh_screenshot,
     start_llm_workers,
     wait_for_fight_start,
     wait_for_screenshot_warmup,
@@ -27,6 +28,9 @@ ENABLE_LOG_WINDOW = True
 CAPTURES_DIR = "captures"
 EXPERIMENT_MATCH_COUNT = 1
 MATCH_MAX_SECONDS = 230.0
+AI_PLAYERS = (1, 2)
+USE_ON_DEMAND_SCREENSHOTS = True
+MAME_WINDOW_ARGS: list[str] = ["-resolution", "960x720"]
 LLM_ROUND_START_BUFFER_SECONDS = 12.0
 LLM_SCREENSHOT_WARMUP_UPDATES = 4
 
@@ -102,6 +106,12 @@ def _run_single_match(
         captures_dir=match_dir,
         round_start_buffer_seconds=LLM_ROUND_START_BUFFER_SECONDS,
         screenshot_warmup_updates=LLM_SCREENSHOT_WARMUP_UPDATES,
+        snapshot_request_path=(
+            match_dir / "snapshot_request.txt"
+            if USE_ON_DEMAND_SCREENSHOTS
+            else None
+        ),
+        ai_players=AI_PLAYERS,
     )
     initialize_command_files(arena_config)
     state_path = match_dir / "match_state.json"
@@ -121,17 +131,30 @@ def _run_single_match(
             output_dir=match_dir,
             interval_seconds=0.5,
             extra_lua="\n".join(extra_lua_parts),
+            on_demand=USE_ON_DEMAND_SCREENSHOTS,
         )
         process = open_sfiii3n(
-            extra_args=snapshot_loop.mame_args() + ["-skip_gameinfo"]
+            extra_args=snapshot_loop.mame_args() + MAME_WINDOW_ARGS + ["-skip_gameinfo"]
         )
 
         wait_for_fight_start(arena_config, emit_log if log_window else None)
-        wait_for_screenshot_warmup(
-            arena_config.screenshot_path,
-            arena_config.screenshot_warmup_updates,
-            emit_log if log_window else None,
-        )
+        if USE_ON_DEMAND_SCREENSHOTS:
+            for warmup_index in range(arena_config.screenshot_warmup_updates):
+                request_fresh_screenshot(
+                    screenshot_path=arena_config.screenshot_path,
+                    request_path=arena_config.snapshot_request_path,
+                )
+                emit_log(
+                    "status",
+                    "Observed on-demand screenshot warmup update "
+                    f"{warmup_index + 1}/{arena_config.screenshot_warmup_updates}.",
+                )
+        else:
+            wait_for_screenshot_warmup(
+                arena_config.screenshot_path,
+                arena_config.screenshot_warmup_updates,
+                emit_log if log_window else None,
+            )
         llm_workers = start_llm_workers(
             arena_config,
             stop_event,
@@ -198,6 +221,7 @@ def main() -> None:
         p2_character='dudley',
         p1_super_art=1,
         p2_super_art=1,
+        active_players=AI_PLAYERS,
     )
     log_window = SplitLogWindow() if (ENABLE_LLM_ARENA and ENABLE_LOG_WINDOW) else None
 
