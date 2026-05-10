@@ -25,6 +25,7 @@ SCREENSHOT_PATH = CAPTURES_DIR / "latest_frame.png"
 COMMAND_PATH_P1 = CAPTURES_DIR / "llm_moves_p1.txt"
 COMMAND_PATH_P2 = CAPTURES_DIR / "llm_moves_p2.txt"
 FIGHT_LOG_PATH = CAPTURES_DIR / "fight_log.csv"
+MATCH_STATE_PATH = CAPTURES_DIR / "match_state.json"
 DEFAULT_FPS = 60.0
 POLL_SECONDS = 1.5
 REQUEST_TIMEOUT_SECONDS = 45.0
@@ -66,6 +67,14 @@ TOKEN_TO_MAME_SUFFIX = {
     "HK": "BUTTON6",
 }
 
+SFIII3N_MEMORY_ADDRESSES = {
+    "fighting": 0x0200EE44,
+    "wins_p1": 0x02011383,
+    "wins_p2": 0x02011385,
+    "health_p1": 0x02068D0B,
+    "health_p2": 0x020691A3,
+}
+
 SYSTEM_PROMPT = """You control one player in Street Fighter III: 3rd Strike.
 You receive one gameplay screenshot and must output only the next controller input sequence.
 
@@ -79,7 +88,7 @@ Controller tokens:
 - NONE means no input for that step.
 
 Input rules:
-- steps must contain 0 to 4 entries.
+- steps must contain 0 to 8 entries.
 - each step must contain 1 to 3 tokens.
 - each step must include hold_frames from 1 to 60.
 - tokens in the same step are pressed at the same time, e.g. ["DOWN","RIGHT"].
@@ -399,6 +408,102 @@ llm_move_subscription = emu.add_machine_frame_notifier(function ()
     end
 
     llm_active_fields = next_active
+end)
+"""
+
+
+def build_match_state_lua(state_path: Path = MATCH_STATE_PATH) -> str:
+    lua_state_path = _lua_path(state_path)
+    lua_temp_path = _lua_path(state_path.with_suffix(".tmp"))
+    return f"""
+local sfiii_state_path = "{lua_state_path}"
+local sfiii_state_temp_path = "{lua_temp_path}"
+local sfiii_state_poll_mod = 30
+local sfiii_state_frame = 0
+local sfiii_state_space = nil
+
+local sfiii_addr_fighting = {SFIII3N_MEMORY_ADDRESSES["fighting"]}
+local sfiii_addr_wins_p1 = {SFIII3N_MEMORY_ADDRESSES["wins_p1"]}
+local sfiii_addr_wins_p2 = {SFIII3N_MEMORY_ADDRESSES["wins_p2"]}
+local sfiii_addr_health_p1 = {SFIII3N_MEMORY_ADDRESSES["health_p1"]}
+local sfiii_addr_health_p2 = {SFIII3N_MEMORY_ADDRESSES["health_p2"]}
+
+local function sfiii_state_get_space()
+    if sfiii_state_space ~= nil then
+        return sfiii_state_space
+    end
+
+    local cpu = manager.machine.devices[":maincpu"]
+    if cpu == nil then
+        return nil
+    end
+
+    sfiii_state_space = cpu.spaces["program"]
+    return sfiii_state_space
+end
+
+local function sfiii_state_read_u8(space, address)
+    local ok, value = pcall(function()
+        return space:read_u8(address)
+    end)
+    if ok then
+        return value
+    end
+    return -1
+end
+
+local function sfiii_state_write()
+    local space = sfiii_state_get_space()
+    if space == nil then
+        return
+    end
+
+    local fighting = sfiii_state_read_u8(space, sfiii_addr_fighting)
+    local wins_p1 = sfiii_state_read_u8(space, sfiii_addr_wins_p1)
+    local wins_p2 = sfiii_state_read_u8(space, sfiii_addr_wins_p2)
+    local health_p1 = sfiii_state_read_u8(space, sfiii_addr_health_p1)
+    local health_p2 = sfiii_state_read_u8(space, sfiii_addr_health_p2)
+    local match_over = (wins_p1 >= 2) or (wins_p2 >= 2)
+    local winner = "unknown"
+
+    if wins_p1 >= 2 and wins_p1 > wins_p2 then
+        winner = "P1"
+    elseif wins_p2 >= 2 and wins_p2 > wins_p1 then
+        winner = "P2"
+    elseif match_over then
+        winner = "draw_or_unknown"
+    end
+
+    local file = io.open(sfiii_state_temp_path, "w")
+    if file == nil then
+        return
+    end
+
+    file:write(string.format(
+        '{{"frame":%d,"fighting":%d,"wins_p1":%d,"wins_p2":%d,"health_p1":%d,"health_p2":%d,"match_over":%s,"winner":"%s"}}',
+        sfiii_state_frame,
+        fighting,
+        wins_p1,
+        wins_p2,
+        health_p1,
+        health_p2,
+        tostring(match_over),
+        winner
+    ))
+    file:close()
+    os.remove(sfiii_state_path)
+    os.rename(sfiii_state_temp_path, sfiii_state_path)
+end
+
+sfiii_state_subscription = emu.add_machine_frame_notifier(function ()
+    if manager.machine.paused or manager.machine.exit_pending then
+        return
+    end
+
+    sfiii_state_frame = sfiii_state_frame + 1
+    if sfiii_state_frame % sfiii_state_poll_mod == 0 then
+        sfiii_state_write()
+    end
 end)
 """
 
