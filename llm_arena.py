@@ -32,7 +32,7 @@ REQUEST_TIMEOUT_SECONDS = 45.0
 REQUEST_RETRY_SECONDS = 1.0
 STEP_PRESS_FRAMES = 4
 STEP_GAP_FRAMES = 1
-MAX_STEPS = 8
+MAX_STEPS = 16
 MAX_TOKENS_PER_STEP = 3
 MAX_HOLD_FRAMES = 60
 SCREENSHOT_READ_RETRIES = 20
@@ -75,6 +75,293 @@ SFIII3N_MEMORY_ADDRESSES = {
     "health_p2": 0x020691A3,
 }
 
+SemanticStep = tuple[str, ...]
+
+
+def _qcf(final_button: str) -> tuple[SemanticStep, ...]:
+    return (
+        ("DOWN",),
+        ("DOWN", "F"),
+        ("F",),
+        ("DOWN",),
+        ("DOWN", "F"),
+        ("F", final_button),
+    )
+
+
+def _qcb(final_button: str) -> tuple[SemanticStep, ...]:
+    return (
+        ("DOWN",),
+        ("DOWN", "B"),
+        ("B",),
+        ("DOWN",),
+        ("DOWN", "B"),
+        ("B", final_button),
+    )
+
+
+def _qcf_then(final_button: str, followup_button: str) -> tuple[SemanticStep, ...]:
+    return _qcf(final_button) + ((followup_button,),)
+
+
+def _qcf_then_qcf(final_button: str, followup_button: str) -> tuple[SemanticStep, ...]:
+    return _qcf(final_button) + (
+        ("DOWN",),
+        ("DOWN", "F"),
+        ("F", followup_button),
+    )
+
+
+def _triple_down(final_buttons: tuple[str, ...]) -> tuple[SemanticStep, ...]:
+    return (
+        ("DOWN",),
+        ("DOWN",),
+        ("DOWN",) + final_buttons,
+    )
+
+
+def _shun_goku_satsu() -> tuple[SemanticStep, ...]:
+    return (
+        ("LP",),
+        ("LP",),
+        ("F",),
+        ("LK",),
+        ("HP",),
+    )
+
+
+def _circle(final_button: str) -> tuple[SemanticStep, ...]:
+    return (
+        ("F",),
+        ("DOWN", "F"),
+        ("DOWN",),
+        ("DOWN", "B"),
+        ("B",),
+        ("UP", "B"),
+        ("UP",),
+        ("UP", "F", final_button),
+    )
+
+
+def _double_circle(final_button: str) -> tuple[SemanticStep, ...]:
+    return _circle("")[:-1] + (
+        ("UP", "F"),
+        ("F",),
+        ("DOWN", "F"),
+        ("DOWN",),
+        ("DOWN", "B"),
+        ("B",),
+        ("UP", "B"),
+        ("UP",),
+        ("UP", "F", final_button),
+    )
+
+
+SUPER_ART_GUIDE = {
+    "alex": {
+        1: {
+            "name": "Hyper Bomb",
+            "motion": "360 + punch, close range grab",
+            "steps": _circle("HP"),
+        },
+        2: {
+            "name": "Boomerang Raid",
+            "motion": "qcf, qcf + punch",
+            "steps": _qcf("HP"),
+        },
+        3: {
+            "name": "Stun Gun Headbutt",
+            "motion": "qcf, qcf + punch",
+            "steps": _qcf("HP"),
+        },
+    },
+    "akuma": {
+        1: {
+            "name": "Messatsu Gou Hadou",
+            "motion": "qcf, qcf + punch, air or ground",
+            "steps": _qcf("HP"),
+            "extra": "Max meter extra options: Shun Goku Satsu = LP; LP; forward; LK; HP, Kongou Kokuretsu Zan = DOWN; DOWN; DOWN+LP+MP+HP.",
+        },
+        2: {
+            "name": "Messatsu Gou Shoryu",
+            "motion": "qcf, qcf + punch",
+            "steps": _qcf("HP"),
+            "extra": "Max meter extra options: Shun Goku Satsu = LP; LP; forward; LK; HP, Kongou Kokuretsu Zan = DOWN; DOWN; DOWN+LP+MP+HP.",
+        },
+        3: {
+            "name": "Messatsu Gou Rasen",
+            "motion": "qcf, qcf + kick, air or ground",
+            "steps": _qcf("HK"),
+            "extra": "Max meter extra options: Shun Goku Satsu = LP; LP; forward; LK; HP, Kongou Kokuretsu Zan = DOWN; DOWN; DOWN+LP+MP+HP.",
+        },
+    },
+    "chun_li": {
+        1: {"name": "Kikou Shou", "motion": "qcf, qcf + punch", "steps": _qcf("HP")},
+        2: {"name": "Houyoku Sen", "motion": "qcf, qcf + kick", "steps": _qcf("HK")},
+        3: {"name": "Tensei Ranka", "motion": "qcf, qcf + kick", "steps": _qcf("HK")},
+    },
+    "dudley": {
+        1: {
+            "name": "Rocket Uppercut",
+            "motion": "qcf, qcf + punch",
+            "steps": _qcf("HP"),
+        },
+        2: {
+            "name": "Rolling Thunder",
+            "motion": "qcf, qcf + punch repeatedly",
+            "steps": _qcf("HP"),
+            "extra": "Press punch repeatedly after activation if continuing the Super Art is useful.",
+        },
+        3: {
+            "name": "Corkscrew Blow",
+            "motion": "qcf, qcf + punch",
+            "steps": _qcf("HP"),
+        },
+    },
+    "elena": {
+        1: {"name": "Spinning Beat", "motion": "qcf, qcf + kick", "steps": _qcf("HK")},
+        2: {"name": "Brave Dance", "motion": "qcf, qcf + kick", "steps": _qcf("HK")},
+        3: {
+            "name": "Healing",
+            "motion": "qcf, qcf + hold punch",
+            "steps": _qcf("HP"),
+            "extra": "Hold the punch button longer to continue healing when safe.",
+        },
+    },
+    "hugo": {
+        1: {
+            "name": "Gigas Breaker",
+            "motion": "720 + punch, close range grab",
+            "steps": _double_circle("HP"),
+        },
+        2: {"name": "Megaton Press", "motion": "qcf, qcf + kick", "steps": _qcf("HK")},
+        3: {
+            "name": "Hammer Frenzy",
+            "motion": "qcf, qcf + hold punch",
+            "steps": _qcf("HP"),
+        },
+    },
+    "ibuki": {
+        1: {
+            "name": "Kasumi Suzaku",
+            "motion": "qcf, qcf + punch repeatedly, while jumping",
+            "steps": _qcf("HP"),
+            "extra": "This Super Art must be done while airborne.",
+        },
+        2: {"name": "Yoroi Doushi", "motion": "qcf, qcf + punch", "steps": _qcf("HP")},
+        3: {"name": "Yami Shigure", "motion": "qcf, qcf + punch", "steps": _qcf("HP")},
+    },
+    "ken": {
+        1: {"name": "Shoryu Reppa", "motion": "qcf, qcf + punch", "steps": _qcf("HP")},
+        2: {
+            "name": "Shinryu Ken",
+            "motion": "qcf, qcf + kick repeatedly",
+            "steps": _qcf("HK"),
+            "extra": "Press kick repeatedly after activation if useful.",
+        },
+        3: {"name": "Shippu Jinrai Kyaku", "motion": "qcf, qcf + kick", "steps": _qcf("HK")},
+    },
+    "makoto": {
+        1: {"name": "Seichusen Godanzuki", "motion": "qcf, qcf + punch", "steps": _qcf("HP")},
+        2: {"name": "Abare Tosanami", "motion": "qcf, qcf + kick", "steps": _qcf("HK")},
+        3: {"name": "Tanden Renki", "motion": "qcf, qcf + punch", "steps": _qcf("HP")},
+    },
+    "necro": {
+        1: {
+            "name": "Magnetic Storm",
+            "motion": "qcf, qcf + punch repeatedly",
+            "steps": _qcf("HP"),
+            "extra": "Press punch repeatedly after activation if useful.",
+        },
+        2: {"name": "Slam Dance", "motion": "qcf, qcf + punch, close range grab", "steps": _qcf("HP")},
+        3: {"name": "Electric Snake", "motion": "qcf, qcf + punch", "steps": _qcf("HP")},
+    },
+    "oro": {
+        1: {
+            "name": "Kishin Riki",
+            "motion": "qcf, qcf + punch, then punch, close range grab",
+            "steps": _qcf_then("HP", "HP"),
+            "extra": "At max meter, EX Kishin Riki can use qcf, qcf + LP+MP+HP.",
+        },
+        2: {
+            "name": "Yagyou Dama",
+            "motion": "qcf, qcf + punch",
+            "steps": _qcf("HP"),
+            "extra": "At max meter, EX Yagyou Dama can use qcf, qcf + LP+MP+HP.",
+        },
+        3: {
+            "name": "Tengu Stone",
+            "motion": "qcf, qcf + punch",
+            "steps": _qcf("HP"),
+            "extra": "At max meter, EX Tengu Stone can use qcf, qcf + LP+MP+HP.",
+        },
+    },
+    "q": {
+        1: {"name": "Critical Combo Attack", "motion": "qcf, qcf + punch", "steps": _qcf("HP")},
+        2: {"name": "Deadly Double Combination", "motion": "qcf, qcf + punch", "steps": _qcf("HP")},
+        3: {
+            "name": "Total Destruction",
+            "motion": "qcf, qcf + punch, then qcf + punch or kick",
+            "steps": _qcf_then_qcf("HP", "HP"),
+        },
+    },
+    "remy": {
+        1: {"name": "Light of Justice", "motion": "qcf, qcf + punch", "steps": _qcf("HP")},
+        2: {"name": "Supreme Rising Rage Flash", "motion": "qcf, qcf + kick", "steps": _qcf("HK")},
+        3: {"name": "Blue Nocturne", "motion": "qcf, qcf + kick", "steps": _qcf("HK")},
+    },
+    "ryu": {
+        1: {"name": "Shinkuu Hadouken", "motion": "qcf, qcf + punch", "steps": _qcf("HP")},
+        2: {"name": "Shin Shoryuken", "motion": "qcf, qcf + punch", "steps": _qcf("HP")},
+        3: {
+            "name": "Denjin Hadouken",
+            "motion": "qcf, qcf + hold punch",
+            "steps": _qcf("HP"),
+            "extra": "Hold punch longer to charge Denjin when safe.",
+        },
+    },
+    "sean": {
+        1: {"name": "Hado Burst", "motion": "qcf, qcf + punch", "steps": _qcf("HP")},
+        2: {
+            "name": "Shoryu Cannon",
+            "motion": "qcf, qcf + punch repeatedly",
+            "steps": _qcf("HP"),
+            "extra": "Press punch repeatedly after activation if useful.",
+        },
+        3: {"name": "Hyper Tornado", "motion": "qcf, qcf + punch", "steps": _qcf("HP")},
+    },
+    "twelve": {
+        1: {"name": "X.N.D.L.", "motion": "qcf, qcf + punch", "steps": _qcf("HP")},
+        2: {
+            "name": "X.F.L.A.T.",
+            "motion": "qcf, qcf + kick, while jumping",
+            "steps": _qcf("HK"),
+            "extra": "This Super Art must be done while airborne.",
+        },
+        3: {"name": "X.C.O.P.Y.", "motion": "qcf, qcf + punch", "steps": _qcf("HP")},
+    },
+    "urien": {
+        1: {"name": "Tyrant Slaughter", "motion": "qcf, qcf + punch", "steps": _qcf("HP")},
+        2: {"name": "Temporal Thunder", "motion": "qcf, qcf + punch", "steps": _qcf("HP")},
+        3: {
+            "name": "Aegis Reflector",
+            "motion": "qcf, qcf + punch or LP+MP+HP",
+            "steps": _qcf("HP"),
+            "extra": "LP+MP+HP version is available if a three-punch version is useful.",
+        },
+    },
+    "yang": {
+        1: {"name": "Raishin Mahhaken", "motion": "qcf, qcf + punch", "steps": _qcf("HP")},
+        2: {"name": "Tenshin Senkyutai", "motion": "qcf, qcf + kick", "steps": _qcf("HK")},
+        3: {"name": "Seiei Enbu", "motion": "qcf, qcf + punch", "steps": _qcf("HP")},
+    },
+    "yun": {
+        1: {"name": "You Hou", "motion": "qcf, qcf + punch", "steps": _qcf("HP")},
+        2: {"name": "Sourai Rengeki", "motion": "qcf, qcf + punch", "steps": _qcf("HP")},
+        3: {"name": "Genei Jin", "motion": "qcf, qcf + punch", "steps": _qcf("HP")},
+    },
+}
+
 SYSTEM_PROMPT = """You control one player in Street Fighter III: 3rd Strike.
 You receive one gameplay screenshot and must output only the next controller input sequence.
 
@@ -86,16 +373,25 @@ Controller tokens:
 - LP=light punch, MP=medium punch, HP=heavy punch.
 - LK=light kick, MK=medium kick, HK=heavy kick.
 - NONE means no input for that step.
+- The bottom meter is the Super Art meter. When it shows MAX, a Super Art is available.
+- Throw is LP+LK when close.
+- Universal overhead is MP+MK.
+- EX special moves use two punch buttons or two kick buttons and consume Super Art meter.
+- Dash is two quick forward inputs; backdash is two quick back inputs.
+- High parry is a quick forward tap; low parry is a quick DOWN tap.
+- Charge moves require holding a charge direction before the release direction/button.
 
 Input rules:
-- steps must contain 0 to 8 entries.
+- steps must contain 0 to 16 entries.
 - each step must contain 1 to 3 tokens.
 - each step must include hold_frames from 1 to 60.
 - tokens in the same step are pressed at the same time, e.g. ["DOWN","RIGHT"].
 - steps are executed in order, so use multiple steps for combos, motions, cancels, blocks, movement, or attacks.
 - hold_frames is how long to hold all tokens in that step; use larger values to keep holding a direction or button.
 - LEFT and RIGHT are physical joystick directions, not semantic forward/back. Infer forward, backward, and blocking direction from the screenshot.
-- If no useful action is clear, return {"steps":[{"tokens":["NONE"],"hold_frames":1}]}.
+- Special moves and Super Arts are input as ordered direction/button steps, e.g. quarter-circle motions followed by punch or kick.
+- Use Super Art when you judge it likely to connect or strategically useful; do not waste it if the situation is poor.
+- If no useful action is clear, return {"steps":[{"tokens":["NONE"],"hold_frames":4}]}.
 - Do not include explanations, summaries, markdown, comments, or any text outside the JSON object.
 
 Choose whatever tactic and input sequence you judge most likely to win the round.
@@ -219,6 +515,64 @@ def _emit_log(log_fn: LogFn | None, channel: str, message: str) -> None:
         log_fn(channel, message)
     else:
         print(message)
+
+
+def _normalize_character_key(character_name: str | None) -> str | None:
+    if character_name is None:
+        return None
+    return character_name.strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def _physical_step_text(step: SemanticStep, *, facing_right: bool) -> str:
+    direction_map = {
+        "F": "RIGHT" if facing_right else "LEFT",
+        "B": "LEFT" if facing_right else "RIGHT",
+    }
+    tokens = [direction_map.get(token, token) for token in step if token]
+    return "+".join(tokens)
+
+
+def _physical_sequence_text(
+    steps: Sequence[SemanticStep],
+    *,
+    facing_right: bool,
+) -> str:
+    return "; ".join(
+        step_text
+        for step in steps
+        if (step_text := _physical_step_text(step, facing_right=facing_right))
+    )
+
+
+def _super_art_context(config: FightStartConfig, player_number: int) -> str:
+    if player_number == 1:
+        character = _normalize_character_key(config.p1_character)
+        super_art = config.p1_super_art
+    else:
+        character = _normalize_character_key(config.p2_character)
+        super_art = config.p2_super_art
+
+    if character is None:
+        return ""
+
+    guide = SUPER_ART_GUIDE.get(character, {}).get(super_art)
+    if guide is None:
+        return (
+            f"\nSelected character: {character}. "
+            f"Selected Super Art: SA{super_art}. "
+            "No exact Super Art motion is configured for this character."
+        )
+
+    return (
+        f"\nSelected character: {character}. "
+        f"Selected Super Art: SA{super_art} - {guide['name']} "
+        f"({guide['motion']}). "
+        "When facing right, use: "
+        f"{_physical_sequence_text(guide['steps'], facing_right=True)}. "
+        "When facing left, use: "
+        f"{_physical_sequence_text(guide['steps'], facing_right=False)}."
+        + (f" {guide['extra']}" if guide.get("extra") else "")
+    )
 
 
 def build_move_bridge_lua(command_path_p1: Path, command_path_p2: Path) -> str:
@@ -651,10 +1005,12 @@ def call_openrouter_model(
     model: str,
     screenshot_path: Path,
     player_number: int,
+    fight_start: FightStartConfig,
     action_history: Sequence[str] | None = None,
 ) -> ModelCallResult:
     screenshot_url = _encode_image_as_data_url(screenshot_path)
     player_prompt = PLAYER_PROMPT_TEMPLATE.format(player_number=player_number)
+    player_prompt += _super_art_context(fight_start, player_number)
     if action_history:
         history = ", ".join(action_history)
         player_prompt += (
@@ -681,7 +1037,7 @@ def call_openrouter_model(
             },
         ],
         "temperature": 0.2,
-        "max_tokens": 120,
+        "max_tokens": 420,
     }
     data = json.dumps(payload).encode("utf-8")
     req = request.Request(
@@ -875,6 +1231,7 @@ def llm_worker(
     command_path: Path,
     player_number: int,
     poll_seconds: float,
+    fight_start: FightStartConfig,
     use_action_history: bool = False,
     experiment_logger: ExperimentLogger | None = None,
     log_fn: LogFn | None = None,
@@ -903,6 +1260,7 @@ def llm_worker(
                 model=model,
                 screenshot_path=screenshot_path,
                 player_number=player_number,
+                fight_start=fight_start,
                 action_history=list(recent_actions) if use_action_history else None,
             )
             player_move = result.player_move
@@ -976,6 +1334,7 @@ def start_llm_workers(
                 "command_path": config.command_path_p1,
                 "player_number": 1,
                 "poll_seconds": config.poll_seconds,
+                "fight_start": config.fight_start,
                 "use_action_history": config.use_action_history,
                 "experiment_logger": experiment_logger,
                 "log_fn": log_fn,
@@ -993,6 +1352,7 @@ def start_llm_workers(
                 "command_path": config.command_path_p2,
                 "player_number": 2,
                 "poll_seconds": config.poll_seconds,
+                "fight_start": config.fight_start,
                 "use_action_history": config.use_action_history,
                 "experiment_logger": experiment_logger,
                 "log_fn": log_fn,
