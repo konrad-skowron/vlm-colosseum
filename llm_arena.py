@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import csv
 import json
 import os
 import re
 import threading
 import time
+from collections import deque
 from base64 import b64encode
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 from urllib import error, request
 
 from fight_starter import (
@@ -21,17 +24,20 @@ CAPTURES_DIR = Path("captures")
 SCREENSHOT_PATH = CAPTURES_DIR / "latest_frame.png"
 COMMAND_PATH_P1 = CAPTURES_DIR / "llm_moves_p1.txt"
 COMMAND_PATH_P2 = CAPTURES_DIR / "llm_moves_p2.txt"
+FIGHT_LOG_PATH = CAPTURES_DIR / "fight_log.csv"
 DEFAULT_FPS = 60.0
 POLL_SECONDS = 1.5
 REQUEST_TIMEOUT_SECONDS = 45.0
 REQUEST_RETRY_SECONDS = 1.0
 STEP_PRESS_FRAMES = 4
 STEP_GAP_FRAMES = 1
-MAX_STEPS = 4
+MAX_STEPS = 8
 MAX_TOKENS_PER_STEP = 3
 MAX_HOLD_FRAMES = 60
-SCREENSHOT_READ_RETRIES = 5
-SCREENSHOT_READ_RETRY_SECONDS = 0.1
+SCREENSHOT_READ_RETRIES = 20
+SCREENSHOT_READ_RETRY_SECONDS = 0.05
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+PNG_IEND_CHUNK = b"\x00\x00\x00\x00IEND\xaeB`\x82"
 
 ALLOWED_MOVE_TOKENS = (
     "UP",
@@ -60,30 +66,34 @@ TOKEN_TO_MAME_SUFFIX = {
     "HK": "BUTTON6",
 }
 
-SYSTEM_PROMPT = """You are controlling a player in Street Fighter III: 3rd Strike.
-You will receive a single gameplay screenshot.
-Return only JSON with this shape:
-{"steps":[{"tokens":["TOKEN"],"hold_frames":4}],"summary":"short text"}
+SYSTEM_PROMPT = """You control one player in Street Fighter III: 3rd Strike.
+You receive one gameplay screenshot and must output only the next controller input sequence.
 
-Rules:
-- Allowed tokens: UP, DOWN, LEFT, RIGHT, LP, MP, HP, LK, MK, HK, NONE
-- steps must be a list with 0 to 4 entries
-- each step must contain 1 to 3 tokens
-- each step must include hold_frames from 1 to 60
-- simultaneous inputs go in the same step
-- sequential inputs go in separate steps
-- your objective is to win the round
-- choose the move sequence you believe best improves your chance to win
-- do not force a fixed style such as always attacking, always retreating, or always waiting
-- use larger hold_frames when you want to keep holding a direction or button
-- if no useful action is clear, return {"steps":[{"tokens":["NONE"],"hold_frames":4}],"summary":"..."}
-- do not add markdown
+Return exactly one JSON object and nothing else:
+{"steps":[{"tokens":["TOKEN"],"hold_frames":4}]}
+
+Controller tokens:
+- UP, DOWN, LEFT, RIGHT are joystick directions.
+- LP=light punch, MP=medium punch, HP=heavy punch.
+- LK=light kick, MK=medium kick, HK=heavy kick.
+- NONE means no input for that step.
+
+Input rules:
+- steps must contain 0 to 4 entries.
+- each step must contain 1 to 3 tokens.
+- each step must include hold_frames from 1 to 60.
+- tokens in the same step are pressed at the same time, e.g. ["DOWN","RIGHT"].
+- steps are executed in order, so use multiple steps for combos, motions, cancels, blocks, movement, or attacks.
+- hold_frames is how long to hold all tokens in that step; use larger values to keep holding a direction or button.
+- LEFT and RIGHT are physical joystick directions, not semantic forward/back. Infer forward, backward, and blocking direction from the screenshot.
+- If no useful action is clear, return {"steps":[{"tokens":["NONE"],"hold_frames":1}]}.
+- Do not include explanations, summaries, markdown, comments, or any text outside the JSON object.
+
+Choose whatever tactic and input sequence you judge most likely to win the round.
 """
 
 PLAYER_PROMPT_TEMPLATE = """You are Player {player_number}.
-Choose the next short input sequence for Player {player_number} only.
-Play to win using your own judgment.
-Keep it brief and usually executable in under one second.
+Choose only the next short input sequence for Player {player_number}.
 """
 
 
@@ -100,6 +110,7 @@ class ArenaConfig:
     command_path_p2: Path = COMMAND_PATH_P2
     captures_dir: Path = CAPTURES_DIR
     poll_seconds: float = POLL_SECONDS
+    use_action_history: bool = False
 
 
 @dataclass(slots=True)
@@ -114,7 +125,64 @@ class ParsedStep:
     hold_frames: int
 
 
+@dataclass(slots=True)
+class ModelCallResult:
+    player_move: ParsedMove
+    latency_ms: float
+    is_hallucination: bool
+
+
 LogFn = Callable[[str, str], None]
+
+
+class ExperimentLogger:
+    _fieldnames = (
+        "timestamp",
+        "player_label",
+        "model_name",
+        "parsed_action",
+        "latency_ms",
+        "is_hallucination",
+    )
+
+    def __init__(self, log_path: Path = FIGHT_LOG_PATH) -> None:
+        self.log_path = log_path
+        self._lock = threading.Lock()
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_header()
+
+    def _ensure_header(self) -> None:
+        with self._lock:
+            should_write_header = (
+                not self.log_path.exists() or self.log_path.stat().st_size == 0
+            )
+            if not should_write_header:
+                return
+            with self.log_path.open("a", encoding="utf-8", newline="") as file:
+                writer = csv.DictWriter(file, fieldnames=self._fieldnames)
+                writer.writeheader()
+
+    def log_action(
+        self,
+        *,
+        player_label: str,
+        model_name: str,
+        parsed_action: str,
+        latency_ms: float,
+        is_hallucination: bool,
+    ) -> None:
+        row = {
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "player_label": player_label,
+            "model_name": model_name,
+            "parsed_action": parsed_action,
+            "latency_ms": f"{latency_ms:.3f}",
+            "is_hallucination": str(is_hallucination).lower(),
+        }
+        with self._lock:
+            with self.log_path.open("a", encoding="utf-8", newline="") as file:
+                writer = csv.DictWriter(file, fieldnames=self._fieldnames)
+                writer.writerow(row)
 
 
 def load_dotenv(dotenv_path: Path = Path(".env")) -> None:
@@ -402,11 +470,10 @@ def _normalize_steps(raw_steps: Any) -> list[ParsedStep]:
 
 def parse_model_move(response_text: str) -> ParsedMove:
     data = _extract_json_object(response_text)
+    if "steps" not in data:
+        raise KeyError("steps")
     steps = _normalize_steps(data.get("steps", []))
-    summary = data.get("summary", "")
-    if not isinstance(summary, str):
-        summary = ""
-    return ParsedMove(steps=steps, summary=summary.strip())
+    return ParsedMove(steps=steps, summary="")
 
 
 def _steps_to_command_line(parsed_move: ParsedMove) -> str:
@@ -428,14 +495,41 @@ def _move_duration_seconds(parsed_move: ParsedMove) -> float:
     return total_frames / DEFAULT_FPS
 
 
+def _fallback_move() -> ParsedMove:
+    return ParsedMove(steps=[], summary="")
+
+
+def _looks_like_complete_png(image_bytes: bytes) -> bool:
+    return (
+        image_bytes.startswith(PNG_SIGNATURE)
+        and image_bytes.endswith(PNG_IEND_CHUNK)
+    )
+
+
 def _read_screenshot_bytes(path: Path) -> bytes:
-    last_error: OSError | None = None
+    last_error: OSError | RuntimeError | None = None
     for _ in range(SCREENSHOT_READ_RETRIES):
         try:
-            return path.read_bytes()
+            stat_before = path.stat()
+            image_bytes = path.read_bytes()
+            stat_after = path.stat()
         except OSError as exc:
             last_error = exc
             time.sleep(SCREENSHOT_READ_RETRY_SECONDS)
+            continue
+
+        is_stable_file = (
+            stat_before.st_size == stat_after.st_size
+            and stat_before.st_mtime_ns == stat_after.st_mtime_ns
+        )
+        if is_stable_file and _looks_like_complete_png(image_bytes):
+            return image_bytes
+
+        last_error = RuntimeError(
+            f"Screenshot file is not a stable complete PNG yet: {path}"
+        )
+        time.sleep(SCREENSHOT_READ_RETRY_SECONDS)
+
     assert last_error is not None
     raise last_error
 
@@ -452,8 +546,17 @@ def call_openrouter_model(
     model: str,
     screenshot_path: Path,
     player_number: int,
-) -> ParsedMove:
+    action_history: Sequence[str] | None = None,
+) -> ModelCallResult:
     screenshot_url = _encode_image_as_data_url(screenshot_path)
+    player_prompt = PLAYER_PROMPT_TEMPLATE.format(player_number=player_number)
+    if action_history:
+        history = ", ".join(action_history)
+        player_prompt += (
+            "\nYour recent actions (oldest to newest): "
+            f"[{history}]"
+        )
+
     payload = {
         "model": model,
         "messages": [
@@ -463,9 +566,7 @@ def call_openrouter_model(
                 "content": [
                     {
                         "type": "text",
-                        "text": PLAYER_PROMPT_TEMPLATE.format(
-                            player_number=player_number
-                        ),
+                        "text": player_prompt,
                     },
                     {
                         "type": "image_url",
@@ -475,7 +576,7 @@ def call_openrouter_model(
             },
         ],
         "temperature": 0.2,
-        "max_tokens": 200,
+        "max_tokens": 120,
     }
     data = json.dumps(payload).encode("utf-8")
     req = request.Request(
@@ -488,6 +589,7 @@ def call_openrouter_model(
         method="POST",
     )
 
+    request_start = time.perf_counter()
     try:
         with request.urlopen(req, timeout=REQUEST_TIMEOUT_SECONDS) as response:
             body = response.read().decode("utf-8")
@@ -499,15 +601,46 @@ def call_openrouter_model(
     except error.URLError as exc:
         raise RuntimeError(f"OpenRouter request failed: {exc}") from exc
 
-    payload_data = json.loads(body)
-    raw_content = (
-        payload_data["choices"][0]["message"]["content"]
-        if payload_data.get("choices")
-        else ""
-    )
+    latency_ms = (time.perf_counter() - request_start) * 1000.0
+
+    try:
+        payload_data = json.loads(body)
+    except json.JSONDecodeError:
+        return ModelCallResult(
+            player_move=_fallback_move(),
+            latency_ms=latency_ms,
+            is_hallucination=True,
+        )
+
+    try:
+        raw_content = payload_data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return ModelCallResult(
+            player_move=_fallback_move(),
+            latency_ms=latency_ms,
+            is_hallucination=True,
+        )
     if not isinstance(raw_content, str):
-        raise RuntimeError("OpenRouter response content was not text")
-    return parse_model_move(raw_content)
+        return ModelCallResult(
+            player_move=_fallback_move(),
+            latency_ms=latency_ms,
+            is_hallucination=True,
+        )
+
+    try:
+        player_move = parse_model_move(raw_content)
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return ModelCallResult(
+            player_move=_fallback_move(),
+            latency_ms=latency_ms,
+            is_hallucination=True,
+        )
+
+    return ModelCallResult(
+        player_move=player_move,
+        latency_ms=latency_ms,
+        is_hallucination=False,
+    )
 
 
 def write_player_command_file(
@@ -541,6 +674,7 @@ def build_arena_config(
     captures_dir: Path = CAPTURES_DIR,
     round_start_buffer_seconds: float = 6.0,
     screenshot_warmup_updates: int = 3,
+    use_action_history: bool = False,
 ) -> ArenaConfig:
     return ArenaConfig(
         fight_start=fight_start or FightStartConfig(),
@@ -553,6 +687,7 @@ def build_arena_config(
         screenshot_path=captures_dir / "latest_frame.png",
         command_path_p1=captures_dir / "llm_moves_p1.txt",
         command_path_p2=captures_dir / "llm_moves_p2.txt",
+        use_action_history=use_action_history,
     )
 
 
@@ -635,10 +770,14 @@ def llm_worker(
     command_path: Path,
     player_number: int,
     poll_seconds: float,
+    use_action_history: bool = False,
+    experiment_logger: ExperimentLogger | None = None,
     log_fn: LogFn | None = None,
 ) -> None:
     command_id = 0
     channel = f"p{player_number}"
+    player_label = f"P{player_number}"
+    recent_actions: deque[str] = deque(maxlen=5)
     _emit_log(log_fn, channel, f"worker starting for model {model}")
     wait_for_screenshot_exists(screenshot_path)
     _emit_log(
@@ -654,18 +793,33 @@ def llm_worker(
                 channel,
                 f"requesting next move from {model}",
             )
-            player_move = call_openrouter_model(
+            result = call_openrouter_model(
                 api_key=api_key,
                 model=model,
                 screenshot_path=screenshot_path,
                 player_number=player_number,
+                action_history=list(recent_actions) if use_action_history else None,
             )
+            player_move = result.player_move
+            parsed_action = _steps_to_command_line(player_move)
             _emit_log(
                 log_fn,
                 channel,
-                f"{model}: {_steps_to_command_line(player_move)}"
+                f"{model}: {parsed_action}"
+                + f" | latency={result.latency_ms:.1f}ms"
+                + (" | hallucination" if result.is_hallucination else "")
                 + (f" | {player_move.summary}" if player_move.summary else ""),
             )
+            if experiment_logger is not None:
+                experiment_logger.log_action(
+                    player_label=player_label,
+                    model_name=model,
+                    parsed_action=parsed_action,
+                    latency_ms=result.latency_ms,
+                    is_hallucination=result.is_hallucination,
+                )
+            if use_action_history:
+                recent_actions.append(parsed_action)
 
             command_id += 1
             write_player_command_file(
@@ -680,6 +834,14 @@ def llm_worker(
             )
         except Exception as exc:
             _emit_log(log_fn, channel, f"worker error: {exc}")
+            if experiment_logger is not None:
+                experiment_logger.log_action(
+                    player_label=player_label,
+                    model_name=model,
+                    parsed_action="NONE",
+                    latency_ms=0.0,
+                    is_hallucination=True,
+                )
             if stop_event.wait(REQUEST_RETRY_SECONDS):
                 return
             continue
@@ -697,6 +859,7 @@ def start_llm_workers(
     stop_event: threading.Event,
     log_fn: LogFn | None = None,
 ) -> list[threading.Thread]:
+    experiment_logger = ExperimentLogger(config.captures_dir / "fight_log.csv")
     workers = [
         threading.Thread(
             target=llm_worker,
@@ -708,6 +871,8 @@ def start_llm_workers(
                 "command_path": config.command_path_p1,
                 "player_number": 1,
                 "poll_seconds": config.poll_seconds,
+                "use_action_history": config.use_action_history,
+                "experiment_logger": experiment_logger,
                 "log_fn": log_fn,
             },
             daemon=True,
@@ -723,6 +888,8 @@ def start_llm_workers(
                 "command_path": config.command_path_p2,
                 "player_number": 2,
                 "poll_seconds": config.poll_seconds,
+                "use_action_history": config.use_action_history,
+                "experiment_logger": experiment_logger,
                 "log_fn": log_fn,
             },
             daemon=True,
