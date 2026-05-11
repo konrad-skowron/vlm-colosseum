@@ -32,6 +32,8 @@ POLL_SECONDS = 1.5
 REQUEST_TIMEOUT_SECONDS = 45.0
 REQUEST_RETRY_SECONDS = 1.0
 SNAPSHOT_REQUEST_TIMEOUT_SECONDS = 2.0
+SNAPSHOT_REQUEST_WRITE_RETRIES = 10
+SNAPSHOT_REQUEST_WRITE_RETRY_SECONDS = 0.02
 STEP_PRESS_FRAMES = 4
 STEP_GAP_FRAMES = 1
 MAX_STEPS = 16
@@ -379,13 +381,13 @@ SUPER_ART_GUIDE = {
 }
 
 SYSTEM_PROMPT = """You control one player in Street Fighter III: 3rd Strike.
-You receive one gameplay screenshot and must output only the next controller input sequence.
+You receive one gameplay screenshot and must output only the next controller input sequence with a very short reason.
 Track your own character by Player number and visual identity, especially character color, not by screen side alone. Characters can switch sides after jumps, throws, cross-ups, or Super Arts.
 The game continues in real time while you are deciding. It does not pause waiting for your response, so the state may change before your move is executed.
 
 Return exactly one JSON object and nothing else.
 Example valid response:
-{"steps":[{"tokens":["RIGHT"],"hold_frames":4}]}
+{"steps":[{"tokens":["RIGHT"],"hold_frames":4}],"summary":"Advance to reach poke range."}
 
 Controller tokens:
 - UP, DOWN, LEFT, RIGHT are joystick directions.
@@ -412,7 +414,8 @@ Input rules:
 - Special moves and Super Arts are input as ordered direction/button steps, e.g. quarter-circle motions followed by punch or kick.
 - After a side switch, re-identify which visible character is yours before choosing directions. Do not assume you are still on the same side as in the previous screenshot.
 - If no useful action is clear, return {"steps":[{"tokens":["NONE"],"hold_frames":4}]}.
-- Do not include explanations, summaries, markdown, comments, or any text outside the JSON object.
+- Include a short summary string with at most 12 words explaining your immediate intent.
+- Do not include markdown, comments, or any text outside the JSON object.
 
 Choose whatever tactic and input sequence you judge most likely to win the round.
 """
@@ -446,6 +449,7 @@ class ArenaConfig:
 class ParsedMove:
     steps: list["ParsedStep"]
     summary: str
+    trace: str = ""
 
 
 @dataclass(slots=True)
@@ -559,8 +563,13 @@ class ExperimentLogger:
         "round_win_delta",
     )
 
-    def __init__(self, log_path: Path = FIGHT_LOG_PATH) -> None:
+    def __init__(
+        self,
+        log_path: Path = FIGHT_LOG_PATH,
+        tensorboard_logger: Any | None = None,
+    ) -> None:
         self.log_path = log_path
+        self.tensorboard_logger = tensorboard_logger
         self._lock = threading.Lock()
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_header()
@@ -623,6 +632,8 @@ class ExperimentLogger:
             with self.log_path.open("a", encoding="utf-8", newline="") as file:
                 writer = csv.DictWriter(file, fieldnames=self._fieldnames)
                 writer.writerow(row)
+            if self.tensorboard_logger is not None:
+                self.tensorboard_logger.log_action_row(row)
 
 
 def load_dotenv(dotenv_path: Path = Path(".env")) -> None:
@@ -1076,12 +1087,31 @@ def _normalize_steps(raw_steps: Any) -> list[ParsedStep]:
     return normalized_steps
 
 
+def _normalize_summary(raw_summary: Any) -> str:
+    if not isinstance(raw_summary, str):
+        return ""
+    summary = " ".join(raw_summary.strip().split())
+    if not summary:
+        return ""
+    words = summary.split()
+    return " ".join(words[:12])[:160]
+
+
+def format_decision_details(parsed_move: ParsedMove) -> str:
+    if parsed_move.summary and parsed_move.trace:
+        return f"{parsed_move.summary} | tools: {parsed_move.trace}"
+    if parsed_move.summary:
+        return parsed_move.summary
+    return parsed_move.trace
+
+
 def parse_model_move(response_text: str) -> ParsedMove:
     data = _extract_json_object(response_text)
     if "steps" not in data:
         raise KeyError("steps")
     steps = _normalize_steps(data.get("steps", []))
-    return ParsedMove(steps=steps, summary="")
+    summary = _normalize_summary(data.get("summary", ""))
+    return ParsedMove(steps=steps, summary=summary)
 
 
 def _steps_to_command_line(parsed_move: ParsedMove) -> str:
@@ -1159,10 +1189,18 @@ def request_fresh_screenshot(
     with _SNAPSHOT_REQUEST_LOCK:
         previous_mtime = screenshot_path.stat().st_mtime_ns if screenshot_path.exists() else None
         request_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = request_path.with_suffix(".tmp")
         request_id = str(time.time_ns())
-        temp_path.write_text(request_id, encoding="utf-8")
-        temp_path.replace(request_path)
+        last_error: OSError | None = None
+        for _ in range(SNAPSHOT_REQUEST_WRITE_RETRIES):
+            try:
+                request_path.write_text(request_id, encoding="utf-8")
+                last_error = None
+                break
+            except OSError as exc:
+                last_error = exc
+                time.sleep(SNAPSHOT_REQUEST_WRITE_RETRY_SECONDS)
+        if last_error is not None:
+            raise last_error
 
         deadline = time.perf_counter() + SNAPSHOT_REQUEST_TIMEOUT_SECONDS
         while time.perf_counter() < deadline:
@@ -1472,7 +1510,11 @@ def llm_worker(
                 f"{model}: {parsed_action}"
                 + f" | latency={result.latency_ms:.1f}ms"
                 + (" | hallucination" if result.is_hallucination else "")
-                + (f" | {player_move.summary}" if player_move.summary else ""),
+                + (
+                    f" | {format_decision_details(player_move)}"
+                    if format_decision_details(player_move)
+                    else ""
+                ),
             )
             if use_action_history:
                 recent_actions.append(parsed_action)
@@ -1500,7 +1542,7 @@ def llm_worker(
                     model_name=model,
                     command_id=command_id,
                     parsed_action=parsed_action,
-                    decision_details=player_move.summary,
+                    decision_details=format_decision_details(player_move),
                     latency_ms=result.latency_ms,
                     is_hallucination=result.is_hallucination,
                     state_before=state_before,
@@ -1529,8 +1571,12 @@ def start_llm_workers(
     config: ArenaConfig,
     stop_event: threading.Event,
     log_fn: LogFn | None = None,
+    tensorboard_logger: Any | None = None,
 ) -> list[threading.Thread]:
-    experiment_logger = ExperimentLogger(config.captures_dir / "fight_log.csv")
+    experiment_logger = ExperimentLogger(
+        config.captures_dir / "fight_log.csv",
+        tensorboard_logger=tensorboard_logger,
+    )
     workers: list[threading.Thread] = []
 
     if 1 in config.ai_players:

@@ -20,6 +20,7 @@ from llm_arena import (
     ParsedStep,
     _emit_log,
     _fallback_move,
+    _normalize_summary,
     _move_duration_seconds,
     _read_screenshot_bytes,
     _steps_to_command_line,
@@ -27,6 +28,7 @@ from llm_arena import (
     build_arena_config,
     build_match_state_lua,
     build_move_bridge_lua,
+    format_decision_details,
     initialize_command_files,
     load_dotenv,
     read_match_state,
@@ -60,6 +62,7 @@ Controller semantics:
 
 Tool usage rules:
 - Use only tool calls. Do not answer with normal text.
+- Also call set_reason once with one very short summary of your immediate intent.
 - Build a sequence of 0 to 16 steps.
 - Tools that share the same step_index happen at the same time.
 - Increasing step_index values happen in order.
@@ -68,6 +71,7 @@ Tool usage rules:
 - Never use placeholder values such as FORWARD or BACK.
 - After a side switch, re-identify which visible character is yours before choosing directions.
 - If no useful action is clear, call the no_input tool.
+- Keep the summary to at most 12 words.
 
 Choose whatever tactic and input sequence you judge most likely to win the round.
 """
@@ -140,7 +144,26 @@ NO_INPUT_TOOL_DEFINITION = {
     },
 }
 
-AGENT_TOOLS = BUTTON_TOOL_DEFINITIONS + [NO_INPUT_TOOL_DEFINITION]
+REASON_TOOL_DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": "set_reason",
+        "description": "Provide one very short summary of the immediate intent behind this action sequence.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "Very short reason, at most 12 words.",
+                },
+            },
+            "required": ["summary"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+AGENT_TOOLS = BUTTON_TOOL_DEFINITIONS + [NO_INPUT_TOOL_DEFINITION, REASON_TOOL_DEFINITION]
 
 
 def _encode_image_as_data_url(path) -> str:
@@ -169,6 +192,8 @@ def _tool_trace(tool_calls: list[dict[str, Any]]) -> str:
         raw_arguments = function.get("arguments", "{}")
         if not isinstance(tool_name, str):
             continue
+        if tool_name == "set_reason":
+            continue
         try:
             arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else {}
         except json.JSONDecodeError:
@@ -179,6 +204,42 @@ def _tool_trace(tool_calls: list[dict[str, Any]]) -> str:
         hold_frames = arguments.get("hold_frames", "?")
         entries.append(f"{tool_name}(step={step_index},hold={hold_frames})")
     return ", ".join(entries)
+
+
+def _extract_message_summary(message: dict[str, Any]) -> str:
+    raw_content = message.get("content")
+    if isinstance(raw_content, str):
+        return _normalize_summary(raw_content)
+    if isinstance(raw_content, list):
+        fragments: list[str] = []
+        for item in raw_content:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                fragments.append(text.strip())
+        return _normalize_summary(" ".join(fragments))
+    return ""
+
+
+def _extract_reason_from_tool_calls(tool_calls: list[dict[str, Any]]) -> str:
+    for tool_call in tool_calls:
+        function = tool_call.get("function")
+        if not isinstance(function, dict):
+            continue
+        if function.get("name") != "set_reason":
+            continue
+        raw_arguments = function.get("arguments", "{}")
+        if not isinstance(raw_arguments, str):
+            continue
+        try:
+            arguments = json.loads(raw_arguments)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(arguments, dict):
+            continue
+        return _normalize_summary(arguments.get("summary", ""))
+    return ""
 
 
 def _parse_tool_move(tool_calls: list[dict[str, Any]]) -> ParsedMove:
@@ -202,6 +263,9 @@ def _parse_tool_move(tool_calls: list[dict[str, Any]]) -> ParsedMove:
             raise ValueError("invalid tool arguments JSON") from exc
         if not isinstance(arguments, dict):
             raise ValueError("tool arguments must decode to an object")
+
+        if tool_name == "set_reason":
+            continue
 
         step_index = _normalize_tool_int(
             arguments.get("step_index"),
@@ -234,7 +298,7 @@ def _parse_tool_move(tool_calls: list[dict[str, Any]]) -> ParsedMove:
         for index in sorted(steps_by_index)
         if steps_by_index[index].tokens
     ]
-    return ParsedMove(steps=ordered_steps, summary=_tool_trace(tool_calls))
+    return ParsedMove(steps=ordered_steps, summary="", trace=_tool_trace(tool_calls))
 
 
 def call_openrouter_model(
@@ -330,6 +394,11 @@ def call_openrouter_model(
             is_hallucination=True,
         )
 
+    player_move.summary = (
+        _extract_reason_from_tool_calls(tool_calls)
+        or _extract_message_summary(message)
+    )
+
     return ModelCallResult(
         player_move=player_move,
         latency_ms=latency_ms,
@@ -384,13 +453,14 @@ def llm_worker(
             player_move = result.player_move
             parsed_action = _steps_to_command_line(player_move)
             state_before = read_match_state(match_state_path)
+            decision_details = format_decision_details(player_move)
             _emit_log(
                 log_fn,
                 channel,
                 f"{model}: {parsed_action}"
                 + f" | latency={result.latency_ms:.1f}ms"
                 + (" | hallucination" if result.is_hallucination else "")
-                + (f" | tools: {player_move.summary}" if player_move.summary else ""),
+                + (f" | {decision_details}" if decision_details else ""),
             )
             if use_action_history:
                 recent_actions.append(parsed_action)
@@ -418,7 +488,7 @@ def llm_worker(
                     model_name=model,
                     command_id=command_id,
                     parsed_action=parsed_action,
-                    decision_details=player_move.summary,
+                    decision_details=decision_details,
                     latency_ms=result.latency_ms,
                     is_hallucination=result.is_hallucination,
                     state_before=state_before,
@@ -447,8 +517,12 @@ def start_llm_workers(
     config: ArenaConfig,
     stop_event: threading.Event,
     log_fn: LogFn | None = None,
+    tensorboard_logger=None,
 ) -> list[threading.Thread]:
-    experiment_logger = ExperimentLogger(config.captures_dir / "fight_log.csv")
+    experiment_logger = ExperimentLogger(
+        config.captures_dir / "fight_log.csv",
+        tensorboard_logger=tensorboard_logger,
+    )
     workers: list[threading.Thread] = []
 
     if 1 in config.ai_players:

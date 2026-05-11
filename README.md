@@ -12,7 +12,7 @@ The project is being developed as infrastructure for a master's thesis about dec
 4. Python workers request fresh screenshots, send them to selected models, parse JSON input sequences, and write command files.
 5. Lua reads command files and executes inputs inside MAME.
 6. Lua reads selected `sfiii3n` memory addresses and writes `match_state.json`.
-7. `main.py` runs `N` matches and appends summary rows to a per-run `experiment_summary.csv`.
+7. `main.py` runs `N` matches, appends summary rows to a per-run `experiment_summary.csv`, and writes TensorBoard events for visualization.
 
 ## Important Files
 
@@ -21,6 +21,9 @@ The project is being developed as infrastructure for a master's thesis about dec
 
 - `llm_arena.py`  
   OpenRouter integration, prompt construction, model response parsing, command writing, match-state Lua generation, and Super Art context.
+
+- `agent_arena.py`  
+  Tool-calling arena variant. Models choose actions through OpenRouter tools instead of JSON action text.
 
 - `fight_starter.py`  
   Generates Lua for automated match setup and character/Super Art selection.
@@ -34,6 +37,9 @@ The project is being developed as infrastructure for a master's thesis about dec
 - `log_viewer.py`  
   Tkinter telemetry window with separate P1/P2 decision logs.
 
+- `tensorboard_logger.py`  
+  Optional TensorBoard logging for per-action and per-match metrics.
+
 ## Requirements
 
 - Windows
@@ -41,8 +47,7 @@ The project is being developed as infrastructure for a master's thesis about dec
 - MAME installed in `C:\Emulators\mame`
 - `sfiii3n` ROM available to MAME
 - OpenRouter API key
-
-The project currently uses only the Python standard library.
+- `tensorboard` and `tensorboardX` for event logging and dashboards
 
 ## Environment
 
@@ -109,7 +114,8 @@ Models must return only JSON:
     { "tokens": ["DOWN"], "hold_frames": 3 },
     { "tokens": ["DOWN", "RIGHT"], "hold_frames": 3 },
     { "tokens": ["RIGHT", "HP"], "hold_frames": 5 }
-  ]
+  ],
+  "summary": "Advance with a fireball punish attempt."
 }
 ```
 
@@ -132,6 +138,7 @@ Rules enforced by the parser:
 - maximum `16` steps;
 - maximum `3` simultaneous tokens per step;
 - `hold_frames` must be `1-60`;
+- `summary` should be a very short plain-language reason;
 - `LEFT` and `RIGHT` are physical joystick directions, not semantic forward/back.
 
 The prompt also informs models about Super Art meter, selected Super Art commands, throws, overheads, EX moves, dash/backdash, parry, and charge moves.
@@ -145,6 +152,7 @@ Both fight modes also state that the game continues in real time while the model
 
 - `agent`  
   Models use OpenRouter tool calling instead of JSON text output. Tool calls are grouped into ordered input steps and then written to the same MAME command bridge.
+  They should also include one very short plain-text reason alongside the tool calls.
 
 Available tools in `agent` mode:
 
@@ -159,11 +167,16 @@ Available tools in `agent` mode:
 - `press_mk`
 - `press_hk`
 - `no_input`
+- `set_reason`
 
 Each tool call takes:
 
 - `step_index`: 1-based step number; same value means simultaneous input
 - `hold_frames`: how long to hold that step
+
+`set_reason` takes:
+
+- `summary`: one very short plain-language reason for the immediate action
 
 ## Runtime Artifacts
 
@@ -187,7 +200,7 @@ Important files:
   IPC command files read by MAME Lua. These are not logs.
 
 - `fight_log.csv`  
-  Per-action model log with parsed action, decision details, latency, hallucination flag, game state before/after the action, HP deltas, estimated damage, and estimated hit flag.
+  Per-action model log with parsed action, short decision reason, latency, hallucination flag, game state before/after the action, HP deltas, estimated damage, and estimated hit flag. In `agent` mode the tool trace is appended to the decision details.
 
 - `match_state.json`  
   Lua-exported match state from MAME memory: round wins, HP values, `match_over`, and winner.
@@ -197,6 +210,9 @@ Important files:
 
 - `captures/run_YYYYMMDD_HHMMSS/elo_ratings.csv`  
   Final ELO table for models participating in the run.
+
+- `captures/run_YYYYMMDD_HHMMSS/tensorboard/`  
+  TensorBoard event files with per-action telemetry, per-match aggregates, ELO curves, and saved run configuration.
 
 ## Match Result Detection
 
@@ -225,6 +241,22 @@ Estimated hit effectiveness is calculated from HP change after a model action: i
 
 ELO starts at `1500` for each model in a run and is updated after every completed match using the match winner.
 
+## TensorBoard
+
+Each run writes TensorBoard events into `captures/run_YYYYMMDD_HHMMSS/tensorboard/`.
+
+Useful launch command:
+
+```powershell
+tensorboard --logdir .\captures
+```
+
+Logged series include:
+
+- per-action latency, estimated damage, estimated hits, round-win deltas, HP, and round counters;
+- per-match duration, actions, hallucinations, estimated hit rates, and ELO after each match;
+- run configuration as text metadata.
+
 ## Current Limitations
 
 - The project is currently Windows/MAME-path specific.
@@ -238,7 +270,7 @@ ELO starts at `1500` for each model in a run and is updated after every complete
 Useful local checks:
 
 ```powershell
-python -m py_compile main.py llm_arena.py screenshot_loop.py fight_starter.py mame_launcher.py log_viewer.py
+python -m py_compile main.py llm_arena.py agent_arena.py tensorboard_logger.py screenshot_loop.py fight_starter.py mame_launcher.py log_viewer.py
 ```
 
 For a safe smoke test, set:

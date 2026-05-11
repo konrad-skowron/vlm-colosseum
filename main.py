@@ -1,6 +1,7 @@
 import csv
 import json
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 from subprocess import TimeoutExpired
 import threading
@@ -12,10 +13,12 @@ import llm_arena
 from mame_launcher import open_sfiii3n
 from log_viewer import SplitLogWindow
 from screenshot_loop import create_snapshot_loop
+from tensorboard_logger import TensorboardRunLogger
 
 
 ENABLE_LLM_ARENA = True
 ENABLE_LOG_WINDOW = True
+ENABLE_TENSORBOARD = True
 CAPTURES_DIR = "captures"
 EXPERIMENT_MATCH_COUNT = 1
 MATCH_MAX_SECONDS = 230.0
@@ -213,12 +216,38 @@ def _write_elo_ratings(path: Path, ratings: dict[str, float]) -> None:
             )
 
 
+def _build_run_config(run_id: str, fight_start: FightStartConfig) -> dict[str, object]:
+    return {
+        "run_id": run_id,
+        "fight_mode": FIGHT_MODE,
+        "experiment_match_count": EXPERIMENT_MATCH_COUNT,
+        "match_max_seconds": MATCH_MAX_SECONDS,
+        "ai_players": list(AI_PLAYERS),
+        "use_on_demand_screenshots": USE_ON_DEMAND_SCREENSHOTS,
+        "mame_window_args": MAME_WINDOW_ARGS,
+        "round_start_buffer_seconds": LLM_ROUND_START_BUFFER_SECONDS,
+        "screenshot_warmup_updates": LLM_SCREENSHOT_WARMUP_UPDATES,
+        "enable_log_window": ENABLE_LOG_WINDOW,
+        "enable_tensorboard": ENABLE_TENSORBOARD,
+        "elo_initial_rating": ELO_INITIAL_RATING,
+        "elo_k_factor": ELO_K_FACTOR,
+        "p1_character": fight_start.p1_character,
+        "p2_character": fight_start.p2_character,
+        "p1_super_art": fight_start.p1_super_art,
+        "p2_super_art": fight_start.p2_super_art,
+        "active_players": list(fight_start.active_players),
+        "model_p1": os.environ.get("OPENROUTER_MODEL_P1", ""),
+        "model_p2": os.environ.get("OPENROUTER_MODEL_P2", ""),
+    }
+
+
 def _run_single_match(
     *,
     match_index: int,
     fight_start: FightStartConfig,
     match_dir: Path,
     log_window: SplitLogWindow | None,
+    tensorboard_logger: TensorboardRunLogger | None,
 ) -> dict[str, str]:
     stop_event = threading.Event()
     process = None
@@ -299,6 +328,7 @@ def _run_single_match(
             arena_config,
             stop_event,
             emit_log if log_window else None,
+            tensorboard_logger=tensorboard_logger,
         )
 
         match_started_perf = time.perf_counter()
@@ -363,6 +393,7 @@ def _run_single_match(
 
 
 def main() -> None:
+    llm_arena.load_dotenv()
     run_id = datetime.now().strftime("run_%Y%m%d_%H%M%S")
     fight_start = FightStartConfig(
         p1_character='dudley',
@@ -381,11 +412,18 @@ def main() -> None:
     elo_path = captures_root / "elo_ratings.csv"
     elo_ratings: dict[str, float] = {}
     captures_root.mkdir(parents=True, exist_ok=True)
+    tensorboard_logger = TensorboardRunLogger(
+        captures_root / "tensorboard",
+        enabled=ENABLE_TENSORBOARD,
+    )
     print(f"Starting experiment run: {captures_root}")
     print(f"Fight mode: {FIGHT_MODE}")
+    print(f"TensorBoard: {tensorboard_logger.status_message}")
     if log_window is not None:
         log_window.log_status(f"Starting experiment run: {captures_root}")
         log_window.log_status(f"Fight mode: {FIGHT_MODE}")
+        log_window.log_status(f"TensorBoard: {tensorboard_logger.status_message}")
+    tensorboard_logger.log_run_config(_build_run_config(run_id, fight_start))
 
     try:
         for match_index in range(1, EXPERIMENT_MATCH_COUNT + 1):
@@ -395,10 +433,12 @@ def main() -> None:
                 fight_start=fight_start,
                 match_dir=match_dir,
                 log_window=log_window,
+                tensorboard_logger=tensorboard_logger,
             )
             _apply_elo_update(ratings=elo_ratings, row=row)
             _append_experiment_summary(summary_path=summary_path, row=row)
             _write_elo_ratings(elo_path, elo_ratings)
+            tensorboard_logger.log_match_row(match_index, row)
             if log_window is not None:
                 log_window.log_status(
                     f"Finished match {match_index}: "
@@ -408,6 +448,7 @@ def main() -> None:
         if log_window is not None:
             log_window.log_status("Experiment interrupted.")
     finally:
+        tensorboard_logger.close()
         if log_window is not None:
             log_window.log_status("Experiment finished. Close this window to exit.")
 
