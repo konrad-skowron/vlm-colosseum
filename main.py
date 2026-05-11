@@ -7,13 +7,13 @@ from subprocess import TimeoutExpired
 import threading
 import time
 
-import agent_arena
-from fight_starter import FightStartConfig, build_fight_start_lua
-import llm_arena
-from mame_launcher import open_sfiii3n
-from log_viewer import SplitLogWindow
-from screenshot_loop import create_snapshot_loop
-from tensorboard_logger import TensorboardRunLogger
+from src import agent_arena
+from src.fight_starter import FightStartConfig, build_fight_start_lua
+from src import llm_arena
+from src.mame_launcher import open_sfiii3n
+from src.log_viewer import SplitLogWindow
+from src.screenshot_loop import create_snapshot_loop
+from src.tensorboard_logger import TensorboardRunLogger
 
 
 ENABLE_LLM_ARENA = True
