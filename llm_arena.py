@@ -432,6 +432,7 @@ class ArenaConfig:
     screenshot_warmup_updates: int
     screenshot_path: Path = SCREENSHOT_PATH
     snapshot_request_path: Path | None = None
+    match_state_path: Path = MATCH_STATE_PATH
     command_path_p1: Path = COMMAND_PATH_P1
     command_path_p2: Path = COMMAND_PATH_P2
     captures_dir: Path = CAPTURES_DIR
@@ -462,14 +463,98 @@ class ModelCallResult:
 LogFn = Callable[[str, str], None]
 
 
+def read_match_state(state_path: Path) -> dict[str, Any] | None:
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _state_str(state: dict[str, Any] | None, key: str) -> str:
+    if state is None:
+        return ""
+    value = state.get(key)
+    return "" if value is None else str(value)
+
+
+def _state_int(state: dict[str, Any] | None, key: str) -> int | None:
+    if state is None:
+        return None
+    value = state.get(key)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    return None
+
+
+def _valid_health(value: int | None) -> int | None:
+    if value is None or value == 255 or value < 0 or value > 200:
+        return None
+    return value
+
+
+def _estimated_damage(before: int | None, after: int | None) -> int:
+    before = _valid_health(before)
+    after = _valid_health(after)
+    if before is None or after is None:
+        return 0
+    return max(before - after, 0)
+
+
+def _estimate_action_metrics(
+    *,
+    player_number: int,
+    state_before: dict[str, Any] | None,
+    state_after: dict[str, Any] | None,
+) -> dict[str, str]:
+    opponent_number = 2 if player_number == 1 else 1
+    opponent_damage = _estimated_damage(
+        _state_int(state_before, f"health_p{opponent_number}"),
+        _state_int(state_after, f"health_p{opponent_number}"),
+    )
+    self_damage = _estimated_damage(
+        _state_int(state_before, f"health_p{player_number}"),
+        _state_int(state_after, f"health_p{player_number}"),
+    )
+    wins_before = _state_int(state_before, f"wins_p{player_number}") or 0
+    wins_after = _state_int(state_after, f"wins_p{player_number}") or 0
+    round_win_delta = max(wins_after - wins_before, 0)
+    estimated_hit = opponent_damage > 0 or round_win_delta > 0
+    return {
+        "estimated_opponent_damage": str(opponent_damage),
+        "estimated_self_damage": str(self_damage),
+        "estimated_hit": str(estimated_hit).lower(),
+        "round_win_delta": str(round_win_delta),
+    }
+
+
 class ExperimentLogger:
     _fieldnames = (
         "timestamp",
         "player_label",
         "model_name",
+        "command_id",
         "parsed_action",
         "latency_ms",
         "is_hallucination",
+        "state_before_frame",
+        "state_after_frame",
+        "wins_p1_before",
+        "wins_p2_before",
+        "wins_p1_after",
+        "wins_p2_after",
+        "health_p1_before",
+        "health_p2_before",
+        "health_p1_after",
+        "health_p2_after",
+        "estimated_opponent_damage",
+        "estimated_self_damage",
+        "estimated_hit",
+        "round_win_delta",
     )
 
     def __init__(self, log_path: Path = FIGHT_LOG_PATH) -> None:
@@ -494,17 +579,41 @@ class ExperimentLogger:
         *,
         player_label: str,
         model_name: str,
+        command_id: int,
         parsed_action: str,
         latency_ms: float,
         is_hallucination: bool,
+        state_before: dict[str, Any] | None = None,
+        state_after: dict[str, Any] | None = None,
     ) -> None:
+        player_number = 1 if player_label == "P1" else 2
+        metrics = _estimate_action_metrics(
+            player_number=player_number,
+            state_before=state_before,
+            state_after=state_after,
+        )
         row = {
             "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
             "player_label": player_label,
             "model_name": model_name,
+            "command_id": str(command_id),
             "parsed_action": parsed_action,
             "latency_ms": f"{latency_ms:.3f}",
             "is_hallucination": str(is_hallucination).lower(),
+            "state_before_frame": _state_str(state_before, "frame"),
+            "state_after_frame": _state_str(state_after, "frame"),
+            "wins_p1_before": _state_str(state_before, "wins_p1"),
+            "wins_p2_before": _state_str(state_before, "wins_p2"),
+            "wins_p1_after": _state_str(state_after, "wins_p1"),
+            "wins_p2_after": _state_str(state_after, "wins_p2"),
+            "health_p1_before": _state_str(state_before, "health_p1"),
+            "health_p2_before": _state_str(state_before, "health_p2"),
+            "health_p1_after": _state_str(state_after, "health_p1"),
+            "health_p2_after": _state_str(state_after, "health_p2"),
+            "estimated_opponent_damage": metrics["estimated_opponent_damage"],
+            "estimated_self_damage": metrics["estimated_self_damage"],
+            "estimated_hit": metrics["estimated_hit"],
+            "round_win_delta": metrics["round_win_delta"],
         }
         with self._lock:
             with self.log_path.open("a", encoding="utf-8", newline="") as file:
@@ -1228,6 +1337,7 @@ def build_arena_config(
         captures_dir=captures_dir,
         screenshot_path=captures_dir / "latest_frame.png",
         snapshot_request_path=snapshot_request_path,
+        match_state_path=captures_dir / "match_state.json",
         command_path_p1=captures_dir / "llm_moves_p1.txt",
         command_path_p2=captures_dir / "llm_moves_p2.txt",
         use_action_history=use_action_history,
@@ -1312,6 +1422,7 @@ def llm_worker(
     model: str,
     screenshot_path: Path,
     snapshot_request_path: Path | None,
+    match_state_path: Path,
     command_path: Path,
     player_number: int,
     poll_seconds: float,
@@ -1350,6 +1461,7 @@ def llm_worker(
             )
             player_move = result.player_move
             parsed_action = _steps_to_command_line(player_move)
+            state_before = read_match_state(match_state_path)
             _emit_log(
                 log_fn,
                 channel,
@@ -1358,14 +1470,6 @@ def llm_worker(
                 + (" | hallucination" if result.is_hallucination else "")
                 + (f" | {player_move.summary}" if player_move.summary else ""),
             )
-            if experiment_logger is not None:
-                experiment_logger.log_action(
-                    player_label=player_label,
-                    model_name=model,
-                    parsed_action=parsed_action,
-                    latency_ms=result.latency_ms,
-                    is_hallucination=result.is_hallucination,
-                )
             if use_action_history:
                 recent_actions.append(parsed_action)
 
@@ -1380,12 +1484,32 @@ def llm_worker(
                 channel,
                 f"Wrote command {command_id} to {command_path}",
             )
+            wait_seconds = max(
+                poll_seconds,
+                _move_duration_seconds(player_move),
+            )
+            was_stopped = stop_event.wait(wait_seconds)
+            state_after = read_match_state(match_state_path)
+            if experiment_logger is not None:
+                experiment_logger.log_action(
+                    player_label=player_label,
+                    model_name=model,
+                    command_id=command_id,
+                    parsed_action=parsed_action,
+                    latency_ms=result.latency_ms,
+                    is_hallucination=result.is_hallucination,
+                    state_before=state_before,
+                    state_after=state_after,
+                )
+            if was_stopped:
+                return
         except Exception as exc:
             _emit_log(log_fn, channel, f"worker error: {exc}")
             if experiment_logger is not None:
                 experiment_logger.log_action(
                     player_label=player_label,
                     model_name=model,
+                    command_id=command_id,
                     parsed_action="NONE",
                     latency_ms=0.0,
                     is_hallucination=True,
@@ -1393,13 +1517,6 @@ def llm_worker(
             if stop_event.wait(REQUEST_RETRY_SECONDS):
                 return
             continue
-
-        wait_seconds = max(
-            poll_seconds,
-            _move_duration_seconds(player_move),
-        )
-        if stop_event.wait(wait_seconds):
-            return
 
 
 def start_llm_workers(
@@ -1419,6 +1536,7 @@ def start_llm_workers(
                 "model": config.model_p1,
                 "screenshot_path": config.screenshot_path,
                 "snapshot_request_path": config.snapshot_request_path,
+                "match_state_path": config.match_state_path,
                 "command_path": config.command_path_p1,
                 "player_number": 1,
                 "poll_seconds": config.poll_seconds,
@@ -1440,6 +1558,7 @@ def start_llm_workers(
                 "model": config.model_p2,
                 "screenshot_path": config.screenshot_path,
                 "snapshot_request_path": config.snapshot_request_path,
+                "match_state_path": config.match_state_path,
                 "command_path": config.command_path_p2,
                 "player_number": 2,
                 "poll_seconds": config.poll_seconds,

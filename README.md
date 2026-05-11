@@ -12,7 +12,7 @@ The project is being developed as infrastructure for a master's thesis about dec
 4. Python workers request fresh screenshots, send them to selected models, parse JSON input sequences, and write command files.
 5. Lua reads command files and executes inputs inside MAME.
 6. Lua reads selected `sfiii3n` memory addresses and writes `match_state.json`.
-7. `main.py` runs `N` matches and appends summary rows to `captures/experiment_summary.csv`.
+7. `main.py` runs `N` matches and appends summary rows to a per-run `experiment_summary.csv`.
 
 ## Important Files
 
@@ -134,11 +134,11 @@ The prompt also informs models about Super Art meter, selected Super Art command
 
 ## Runtime Artifacts
 
-Each match gets its own directory:
+Each experiment run gets its own directory, and each match is stored inside it:
 
 ```text
-captures/match_001/
-captures/match_002/
+captures/run_YYYYMMDD_HHMMSS/match_001/
+captures/run_YYYYMMDD_HHMMSS/match_002/
 ...
 ```
 
@@ -154,13 +154,16 @@ Important files:
   IPC command files read by MAME Lua. These are not logs.
 
 - `fight_log.csv`  
-  Per-action model log with parsed action, latency, and hallucination flag.
+  Per-action model log with parsed action, latency, hallucination flag, game state before/after the action, HP deltas, estimated damage, and estimated hit flag.
 
 - `match_state.json`  
   Lua-exported match state from MAME memory: round wins, HP values, `match_over`, and winner.
 
-- `captures/experiment_summary.csv`  
-  Batch-level summary with match status, result, model names, duration, and match directory.
+- `captures/run_YYYYMMDD_HHMMSS/experiment_summary.csv`  
+  Batch-level summary with match status, result, model names, duration, final round/HP state, action counts, average latency, hallucinations, estimated damage, estimated hit rate, and ELO before/after the match.
+
+- `captures/run_YYYYMMDD_HHMMSS/elo_ratings.csv`  
+  Final ELO table for models participating in the run.
 
 ## Match Result Detection
 
@@ -177,6 +180,17 @@ health_p2 = 0x020691A3
 The match is considered finished when either player reaches two round wins. HP is useful as telemetry, but final result should be based on `wins_p1/wins_p2`.
 
 Known HP detail: full HP appears to be around `160`. After KO or round transitions, the game may expose `255`, which should be treated as a state/sentinel value, not real health.
+
+## Metrics
+
+The project records two metric levels:
+
+- per-action metrics in `fight_log.csv`;
+- per-match aggregate metrics in `experiment_summary.csv`.
+
+Estimated hit effectiveness is calculated from HP change after a model action: if the opponent's valid HP decreases before the next decision window, the action is counted as an estimated hit. This is an approximation because both players can act at nearly the same time, so it should be interpreted as a practical experimental signal rather than perfect hit-confirm data.
+
+ELO starts at `1500` for each model in a run and is updated after every completed match using the match winner.
 
 ## Current Limitations
 

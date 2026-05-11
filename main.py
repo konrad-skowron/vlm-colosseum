@@ -33,6 +33,8 @@ USE_ON_DEMAND_SCREENSHOTS = True
 MAME_WINDOW_ARGS: list[str] = ["-resolution", "960x720"]
 LLM_ROUND_START_BUFFER_SECONDS = 12.0
 LLM_SCREENSHOT_WARMUP_UPDATES = 4
+ELO_INITIAL_RATING = 1500.0
+ELO_K_FACTOR = 32.0
 
 
 def _terminate_process(process) -> None:
@@ -61,6 +63,26 @@ def _append_experiment_summary(
         "result",
         "model_p1",
         "model_p2",
+        "wins_p1",
+        "wins_p2",
+        "health_p1",
+        "health_p2",
+        "p1_actions",
+        "p2_actions",
+        "p1_avg_latency_ms",
+        "p2_avg_latency_ms",
+        "p1_hallucinations",
+        "p2_hallucinations",
+        "p1_estimated_damage",
+        "p2_estimated_damage",
+        "p1_estimated_hits",
+        "p2_estimated_hits",
+        "p1_estimated_hit_rate",
+        "p2_estimated_hit_rate",
+        "p1_elo_before",
+        "p2_elo_before",
+        "p1_elo_after",
+        "p2_elo_after",
         "match_dir",
     )
     should_write_header = not summary_path.exists() or summary_path.stat().st_size == 0
@@ -76,6 +98,119 @@ def _read_match_state(state_path: Path) -> dict[str, object] | None:
         return json.loads(state_path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return None
+
+
+def _safe_float(value: object) -> float | None:
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value: object) -> int:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _summarize_player_actions(rows: list[dict[str, str]], player_label: str) -> dict[str, str]:
+    player_rows = [row for row in rows if row.get("player_label") == player_label]
+    latencies = [
+        latency
+        for row in player_rows
+        if (latency := _safe_float(row.get("latency_ms"))) is not None
+    ]
+    actions = len(player_rows)
+    hits = sum(1 for row in player_rows if row.get("estimated_hit") == "true")
+    damage = sum(_safe_int(row.get("estimated_opponent_damage")) for row in player_rows)
+    hallucinations = sum(1 for row in player_rows if row.get("is_hallucination") == "true")
+    avg_latency = sum(latencies) / len(latencies) if latencies else 0.0
+    hit_rate = hits / actions if actions else 0.0
+    return {
+        "actions": str(actions),
+        "avg_latency_ms": f"{avg_latency:.3f}",
+        "hallucinations": str(hallucinations),
+        "estimated_damage": str(damage),
+        "estimated_hits": str(hits),
+        "estimated_hit_rate": f"{hit_rate:.3f}",
+    }
+
+
+def _summarize_fight_log(match_dir: Path) -> dict[str, str]:
+    log_path = match_dir / "fight_log.csv"
+    if not log_path.exists():
+        return {}
+
+    with log_path.open("r", encoding="utf-8", newline="") as file:
+        rows = list(csv.DictReader(file))
+
+    p1 = _summarize_player_actions(rows, "P1")
+    p2 = _summarize_player_actions(rows, "P2")
+    return {
+        "p1_actions": p1["actions"],
+        "p2_actions": p2["actions"],
+        "p1_avg_latency_ms": p1["avg_latency_ms"],
+        "p2_avg_latency_ms": p2["avg_latency_ms"],
+        "p1_hallucinations": p1["hallucinations"],
+        "p2_hallucinations": p2["hallucinations"],
+        "p1_estimated_damage": p1["estimated_damage"],
+        "p2_estimated_damage": p2["estimated_damage"],
+        "p1_estimated_hits": p1["estimated_hits"],
+        "p2_estimated_hits": p2["estimated_hits"],
+        "p1_estimated_hit_rate": p1["estimated_hit_rate"],
+        "p2_estimated_hit_rate": p2["estimated_hit_rate"],
+    }
+
+
+def _expected_elo_score(rating_a: float, rating_b: float) -> float:
+    return 1.0 / (1.0 + (10 ** ((rating_b - rating_a) / 400.0)))
+
+
+def _apply_elo_update(
+    *,
+    ratings: dict[str, float],
+    row: dict[str, str],
+) -> None:
+    model_p1 = row["model_p1"]
+    model_p2 = row["model_p2"]
+    ratings.setdefault(model_p1, ELO_INITIAL_RATING)
+    ratings.setdefault(model_p2, ELO_INITIAL_RATING)
+
+    p1_before = ratings[model_p1]
+    p2_before = ratings[model_p2]
+    row["p1_elo_before"] = f"{p1_before:.3f}"
+    row["p2_elo_before"] = f"{p2_before:.3f}"
+
+    if row["result"] == "P1":
+        score_p1 = 1.0
+    elif row["result"] == "P2":
+        score_p1 = 0.0
+    else:
+        score_p1 = 0.5
+
+    if model_p1 != model_p2 and row["result"] in {"P1", "P2", "draw_or_unknown"}:
+        expected_p1 = _expected_elo_score(p1_before, p2_before)
+        expected_p2 = 1.0 - expected_p1
+        score_p2 = 1.0 - score_p1
+        ratings[model_p1] = p1_before + ELO_K_FACTOR * (score_p1 - expected_p1)
+        ratings[model_p2] = p2_before + ELO_K_FACTOR * (score_p2 - expected_p2)
+
+    row["p1_elo_after"] = f"{ratings[model_p1]:.3f}"
+    row["p2_elo_after"] = f"{ratings[model_p2]:.3f}"
+
+
+def _write_elo_ratings(path: Path, ratings: dict[str, float]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=("model_name", "elo_rating"))
+        writer.writeheader()
+        for model_name, rating in sorted(ratings.items()):
+            writer.writerow(
+                {
+                    "model_name": model_name,
+                    "elo_rating": f"{rating:.3f}",
+                }
+            )
 
 
 def _run_single_match(
@@ -114,7 +249,7 @@ def _run_single_match(
         ai_players=AI_PLAYERS,
     )
     initialize_command_files(arena_config)
-    state_path = match_dir / "match_state.json"
+    state_path = arena_config.match_state_path
     extra_lua_parts.append(
         build_move_bridge_lua(
             arena_config.command_path_p1,
@@ -125,6 +260,10 @@ def _run_single_match(
 
     if log_window is not None:
         log_window.log_status(f"Starting match {match_index}.")
+    print(
+        f"Starting match {match_index}/{EXPERIMENT_MATCH_COUNT} "
+        f"-> {match_dir}"
+    )
 
     try:
         snapshot_loop = create_snapshot_loop(
@@ -202,20 +341,28 @@ def _run_single_match(
 
     ended_at = datetime.now(timezone.utc)
     duration_seconds = time.perf_counter() - match_started_perf
-    return {
+    final_state = _read_match_state(state_path) or {}
+    row = {
         "match_index": str(match_index),
         "started_at": started_at.isoformat(timespec="seconds"),
         "ended_at": ended_at.isoformat(timespec="seconds"),
         "duration_seconds": f"{duration_seconds:.3f}",
         "status": status,
         "result": result,
-        "model_p1": arena_config.model_p1,
-        "model_p2": arena_config.model_p2,
+        "model_p1": arena_config.model_p1 or "non_ai_p1",
+        "model_p2": arena_config.model_p2 or "non_ai_p2",
+        "wins_p1": str(final_state.get("wins_p1", "")),
+        "wins_p2": str(final_state.get("wins_p2", "")),
+        "health_p1": str(final_state.get("health_p1", "")),
+        "health_p2": str(final_state.get("health_p2", "")),
         "match_dir": str(match_dir),
     }
+    row.update(_summarize_fight_log(match_dir))
+    return row
 
 
 def main() -> None:
+    run_id = datetime.now().strftime("run_%Y%m%d_%H%M%S")
     fight_start = FightStartConfig(
         p1_character='dudley',
         p2_character='dudley',
@@ -228,8 +375,14 @@ def main() -> None:
     if not ENABLE_LLM_ARENA:
         raise RuntimeError("Batch experiments require ENABLE_LLM_ARENA = True.")
 
-    captures_root = Path(CAPTURES_DIR)
+    captures_root = Path(CAPTURES_DIR) / run_id
     summary_path = captures_root / "experiment_summary.csv"
+    elo_path = captures_root / "elo_ratings.csv"
+    elo_ratings: dict[str, float] = {}
+    captures_root.mkdir(parents=True, exist_ok=True)
+    print(f"Starting experiment run: {captures_root}")
+    if log_window is not None:
+        log_window.log_status(f"Starting experiment run: {captures_root}")
 
     try:
         for match_index in range(1, EXPERIMENT_MATCH_COUNT + 1):
@@ -240,7 +393,9 @@ def main() -> None:
                 match_dir=match_dir,
                 log_window=log_window,
             )
+            _apply_elo_update(ratings=elo_ratings, row=row)
             _append_experiment_summary(summary_path=summary_path, row=row)
+            _write_elo_ratings(elo_path, elo_ratings)
             if log_window is not None:
                 log_window.log_status(
                     f"Finished match {match_index}: "
