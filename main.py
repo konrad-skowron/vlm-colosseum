@@ -6,18 +6,9 @@ from subprocess import TimeoutExpired
 import threading
 import time
 
+import agent_arena
 from fight_starter import FightStartConfig, build_fight_start_lua
-from llm_arena import (
-    build_arena_config,
-    build_match_state_lua,
-    build_move_bridge_lua,
-    initialize_command_files,
-    load_dotenv,
-    request_fresh_screenshot,
-    start_llm_workers,
-    wait_for_fight_start,
-    wait_for_screenshot_warmup,
-)
+import llm_arena
 from mame_launcher import open_sfiii3n
 from log_viewer import SplitLogWindow
 from screenshot_loop import create_snapshot_loop
@@ -29,12 +20,21 @@ CAPTURES_DIR = "captures"
 EXPERIMENT_MATCH_COUNT = 1
 MATCH_MAX_SECONDS = 230.0
 AI_PLAYERS = (1, 2)
+FIGHT_MODE = "agent"
 USE_ON_DEMAND_SCREENSHOTS = True
 MAME_WINDOW_ARGS: list[str] = ["-resolution", "960x720"]
 LLM_ROUND_START_BUFFER_SECONDS = 12.0
 LLM_SCREENSHOT_WARMUP_UPDATES = 4
 ELO_INITIAL_RATING = 1500.0
 ELO_K_FACTOR = 32.0
+
+
+def _select_arena_module():
+    if FIGHT_MODE == "text":
+        return llm_arena
+    if FIGHT_MODE == "agent":
+        return agent_arena
+    raise ValueError(f"Unsupported FIGHT_MODE: {FIGHT_MODE}")
 
 
 def _terminate_process(process) -> None:
@@ -227,6 +227,7 @@ def _run_single_match(
     match_started_perf = time.perf_counter()
     status = "unknown"
     result = "not_detected"
+    arena_module = _select_arena_module()
 
     def emit_log(channel: str, message: str) -> None:
         if log_window is None:
@@ -235,8 +236,8 @@ def _run_single_match(
 
     extra_lua_parts = [build_fight_start_lua(fight_start).strip()]
 
-    load_dotenv()
-    arena_config = build_arena_config(
+    arena_module.load_dotenv()
+    arena_config = arena_module.build_arena_config(
         fight_start=fight_start,
         captures_dir=match_dir,
         round_start_buffer_seconds=LLM_ROUND_START_BUFFER_SECONDS,
@@ -248,15 +249,15 @@ def _run_single_match(
         ),
         ai_players=AI_PLAYERS,
     )
-    initialize_command_files(arena_config)
+    arena_module.initialize_command_files(arena_config)
     state_path = arena_config.match_state_path
     extra_lua_parts.append(
-        build_move_bridge_lua(
+        arena_module.build_move_bridge_lua(
             arena_config.command_path_p1,
             arena_config.command_path_p2,
         ).strip()
     )
-    extra_lua_parts.append(build_match_state_lua(state_path).strip())
+    extra_lua_parts.append(arena_module.build_match_state_lua(state_path).strip())
 
     if log_window is not None:
         log_window.log_status(f"Starting match {match_index}.")
@@ -276,10 +277,10 @@ def _run_single_match(
             extra_args=snapshot_loop.mame_args() + MAME_WINDOW_ARGS + ["-skip_gameinfo"]
         )
 
-        wait_for_fight_start(arena_config, emit_log if log_window else None)
+        arena_module.wait_for_fight_start(arena_config, emit_log if log_window else None)
         if USE_ON_DEMAND_SCREENSHOTS:
             for warmup_index in range(arena_config.screenshot_warmup_updates):
-                request_fresh_screenshot(
+                arena_module.request_fresh_screenshot(
                     screenshot_path=arena_config.screenshot_path,
                     request_path=arena_config.snapshot_request_path,
                 )
@@ -289,12 +290,12 @@ def _run_single_match(
                     f"{warmup_index + 1}/{arena_config.screenshot_warmup_updates}.",
                 )
         else:
-            wait_for_screenshot_warmup(
+            arena_module.wait_for_screenshot_warmup(
                 arena_config.screenshot_path,
                 arena_config.screenshot_warmup_updates,
                 emit_log if log_window else None,
             )
-        llm_workers = start_llm_workers(
+        llm_workers = arena_module.start_llm_workers(
             arena_config,
             stop_event,
             emit_log if log_window else None,
@@ -381,8 +382,10 @@ def main() -> None:
     elo_ratings: dict[str, float] = {}
     captures_root.mkdir(parents=True, exist_ok=True)
     print(f"Starting experiment run: {captures_root}")
+    print(f"Fight mode: {FIGHT_MODE}")
     if log_window is not None:
         log_window.log_status(f"Starting experiment run: {captures_root}")
+        log_window.log_status(f"Fight mode: {FIGHT_MODE}")
 
     try:
         for match_index in range(1, EXPERIMENT_MATCH_COUNT + 1):

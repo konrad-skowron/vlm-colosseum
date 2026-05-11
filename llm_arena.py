@@ -381,6 +381,7 @@ SUPER_ART_GUIDE = {
 SYSTEM_PROMPT = """You control one player in Street Fighter III: 3rd Strike.
 You receive one gameplay screenshot and must output only the next controller input sequence.
 Track your own character by Player number and visual identity, especially character color, not by screen side alone. Characters can switch sides after jumps, throws, cross-ups, or Super Arts.
+The game continues in real time while you are deciding. It does not pause waiting for your response, so the state may change before your move is executed.
 
 Return exactly one JSON object and nothing else.
 Example valid response:
@@ -539,6 +540,7 @@ class ExperimentLogger:
         "model_name",
         "command_id",
         "parsed_action",
+        "decision_details",
         "latency_ms",
         "is_hallucination",
         "state_before_frame",
@@ -581,6 +583,7 @@ class ExperimentLogger:
         model_name: str,
         command_id: int,
         parsed_action: str,
+        decision_details: str = "",
         latency_ms: float,
         is_hallucination: bool,
         state_before: dict[str, Any] | None = None,
@@ -598,6 +601,7 @@ class ExperimentLogger:
             "model_name": model_name,
             "command_id": str(command_id),
             "parsed_action": parsed_action,
+            "decision_details": decision_details,
             "latency_ms": f"{latency_ms:.3f}",
             "is_hallucination": str(is_hallucination).lower(),
             "state_before_frame": _state_str(state_before, "frame"),
@@ -1496,6 +1500,7 @@ def llm_worker(
                     model_name=model,
                     command_id=command_id,
                     parsed_action=parsed_action,
+                    decision_details=player_move.summary,
                     latency_ms=result.latency_ms,
                     is_hallucination=result.is_hallucination,
                     state_before=state_before,
@@ -1511,6 +1516,7 @@ def llm_worker(
                     model_name=model,
                     command_id=command_id,
                     parsed_action="NONE",
+                    decision_details="",
                     latency_ms=0.0,
                     is_hallucination=True,
                 )

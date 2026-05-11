@@ -68,6 +68,7 @@ Main runtime flags are near the top of `main.py`:
 EXPERIMENT_MATCH_COUNT = 1
 MATCH_MAX_SECONDS = 230.0
 AI_PLAYERS = (1, 2)
+FIGHT_MODE = "text"
 USE_ON_DEMAND_SCREENSHOTS = True
 ```
 
@@ -81,6 +82,9 @@ Meaning:
 
 - `AI_PLAYERS`  
   Tuple of AI-controlled players. Use `(1, 2)` for AI vs AI, `(1,)` for P1 AI only, or `(2,)` for P2 AI only.
+
+- `FIGHT_MODE`  
+  Arena control pipeline. Use `"text"` for the current structured JSON action output, or `"agent"` for the tool-calling variant implemented in `agent_arena.py`.
 
 - `USE_ON_DEMAND_SCREENSHOTS`  
   If `True`, MAME takes a fresh screenshot only when a model worker is about to send a request. This is preferred for experiments because it reduces stale observations and unnecessary disk writes.
@@ -132,6 +136,35 @@ Rules enforced by the parser:
 
 The prompt also informs models about Super Art meter, selected Super Art commands, throws, overheads, EX moves, dash/backdash, parry, and charge moves.
 
+Both fight modes also state that the game continues in real time while the model is deciding, so the screenshot may already be slightly stale by the time the response is executed.
+
+## Fight Modes
+
+- `text`  
+  Models return structured JSON action sequences that are validated and converted into controller inputs.
+
+- `agent`  
+  Models use OpenRouter tool calling instead of JSON text output. Tool calls are grouped into ordered input steps and then written to the same MAME command bridge.
+
+Available tools in `agent` mode:
+
+- `press_up`
+- `press_down`
+- `press_left`
+- `press_right`
+- `press_lp`
+- `press_mp`
+- `press_hp`
+- `press_lk`
+- `press_mk`
+- `press_hk`
+- `no_input`
+
+Each tool call takes:
+
+- `step_index`: 1-based step number; same value means simultaneous input
+- `hold_frames`: how long to hold that step
+
 ## Runtime Artifacts
 
 Each experiment run gets its own directory, and each match is stored inside it:
@@ -154,7 +187,7 @@ Important files:
   IPC command files read by MAME Lua. These are not logs.
 
 - `fight_log.csv`  
-  Per-action model log with parsed action, latency, hallucination flag, game state before/after the action, HP deltas, estimated damage, and estimated hit flag.
+  Per-action model log with parsed action, decision details, latency, hallucination flag, game state before/after the action, HP deltas, estimated damage, and estimated hit flag.
 
 - `match_state.json`  
   Lua-exported match state from MAME memory: round wins, HP values, `match_over`, and winner.
