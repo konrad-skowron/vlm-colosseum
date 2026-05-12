@@ -8,7 +8,7 @@ import threading
 import time
 from collections import deque
 from base64 import b64encode
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -43,7 +43,6 @@ SCREENSHOT_READ_RETRIES = 20
 SCREENSHOT_READ_RETRY_SECONDS = 0.05
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 PNG_IEND_CHUNK = b"\x00\x00\x00\x00IEND\xaeB`\x82"
-_SNAPSHOT_REQUEST_LOCK = threading.Lock()
 
 ALLOWED_MOVE_TOKENS = (
     "UP",
@@ -443,6 +442,8 @@ class ArenaConfig:
     poll_seconds: float = POLL_SECONDS
     use_action_history: bool = False
     ai_players: tuple[int, ...] = (1, 2)
+    # Per-instance lock so concurrent matches don't block each other's snapshots.
+    snapshot_request_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 @dataclass(slots=True)
@@ -1182,11 +1183,13 @@ def request_fresh_screenshot(
     *,
     screenshot_path: Path,
     request_path: Path | None,
+    snapshot_request_lock: threading.Lock | None = None,
 ) -> None:
     if request_path is None:
         return
 
-    with _SNAPSHOT_REQUEST_LOCK:
+    lock = snapshot_request_lock or threading.Lock()
+    with lock:
         previous_mtime = screenshot_path.stat().st_mtime_ns if screenshot_path.exists() else None
         request_path.parent.mkdir(parents=True, exist_ok=True)
         request_id = str(time.time_ns())
@@ -1220,6 +1223,7 @@ def call_openrouter_model(
     model: str,
     screenshot_path: Path,
     snapshot_request_path: Path | None,
+    snapshot_request_lock: threading.Lock | None = None,
     player_number: int,
     fight_start: FightStartConfig,
     action_history: Sequence[str] | None = None,
@@ -1227,6 +1231,7 @@ def call_openrouter_model(
     request_fresh_screenshot(
         screenshot_path=screenshot_path,
         request_path=snapshot_request_path,
+        snapshot_request_lock=snapshot_request_lock,
     )
     screenshot_url = _encode_image_as_data_url(screenshot_path)
     player_prompt = PLAYER_PROMPT_TEMPLATE.format(player_number=player_number)
@@ -1464,6 +1469,7 @@ def llm_worker(
     model: str,
     screenshot_path: Path,
     snapshot_request_path: Path | None,
+    snapshot_request_lock: threading.Lock | None = None,
     match_state_path: Path,
     command_path: Path,
     player_number: int,
@@ -1497,6 +1503,7 @@ def llm_worker(
                 model=model,
                 screenshot_path=screenshot_path,
                 snapshot_request_path=snapshot_request_path,
+                snapshot_request_lock=snapshot_request_lock,
                 player_number=player_number,
                 fight_start=fight_start,
                 action_history=list(recent_actions) if use_action_history else None,
@@ -1588,6 +1595,7 @@ def start_llm_workers(
                 "model": config.model_p1,
                 "screenshot_path": config.screenshot_path,
                 "snapshot_request_path": config.snapshot_request_path,
+                "snapshot_request_lock": config.snapshot_request_lock,
                 "match_state_path": config.match_state_path,
                 "command_path": config.command_path_p1,
                 "player_number": 1,
@@ -1610,6 +1618,7 @@ def start_llm_workers(
                 "model": config.model_p2,
                 "screenshot_path": config.screenshot_path,
                 "snapshot_request_path": config.snapshot_request_path,
+                "snapshot_request_lock": config.snapshot_request_lock,
                 "match_state_path": config.match_state_path,
                 "command_path": config.command_path_p2,
                 "player_number": 2,

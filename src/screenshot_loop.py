@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import tempfile
 
@@ -106,8 +107,13 @@ def create_snapshot_loop(
 
     if extra_lua.strip():
         script_contents = script_contents + "\n" + extra_lua.strip() + "\n"
-    script_path = Path(tempfile.gettempdir()) / "mame_snapshot_loop.lua"
-    script_path.write_text(script_contents, encoding="utf-8")
+    # Use a unique temp file so concurrent matches never overwrite each other's script.
+    fd, script_path_str = tempfile.mkstemp(suffix=".lua", prefix="mame_snapshot_loop_")
+    script_path = Path(script_path_str)
+    try:
+        os.write(fd, script_contents.encode("utf-8"))
+    finally:
+        os.close(fd)
 
     return SnapshotLoopConfig(
         output_dir=output_dir,

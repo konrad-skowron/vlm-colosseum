@@ -307,6 +307,7 @@ def call_openrouter_model(
     model: str,
     screenshot_path,
     snapshot_request_path,
+    snapshot_request_lock=None,
     player_number: int,
     fight_start: FightStartConfig,
     action_history=None,
@@ -314,6 +315,7 @@ def call_openrouter_model(
     request_fresh_screenshot(
         screenshot_path=screenshot_path,
         request_path=snapshot_request_path,
+        snapshot_request_lock=snapshot_request_lock,
     )
     screenshot_url = _encode_image_as_data_url(screenshot_path)
     player_prompt = PLAYER_PROMPT_TEMPLATE.format(player_number=player_number)
@@ -413,6 +415,7 @@ def llm_worker(
     model: str,
     screenshot_path,
     snapshot_request_path,
+    snapshot_request_lock=None,
     match_state_path,
     command_path,
     player_number: int,
@@ -446,6 +449,7 @@ def llm_worker(
                 model=model,
                 screenshot_path=screenshot_path,
                 snapshot_request_path=snapshot_request_path,
+                snapshot_request_lock=snapshot_request_lock,
                 player_number=player_number,
                 fight_start=fight_start,
                 action_history=list(recent_actions) if use_action_history else None,
@@ -534,6 +538,7 @@ def start_llm_workers(
                 "model": config.model_p1,
                 "screenshot_path": config.screenshot_path,
                 "snapshot_request_path": config.snapshot_request_path,
+                "snapshot_request_lock": config.snapshot_request_lock,
                 "match_state_path": config.match_state_path,
                 "command_path": config.command_path_p1,
                 "player_number": 1,
@@ -556,6 +561,7 @@ def start_llm_workers(
                 "model": config.model_p2,
                 "screenshot_path": config.screenshot_path,
                 "snapshot_request_path": config.snapshot_request_path,
+                "snapshot_request_lock": config.snapshot_request_lock,
                 "match_state_path": config.match_state_path,
                 "command_path": config.command_path_p2,
                 "player_number": 2,
