@@ -7,3 +7,7 @@ dependencies = [
     "tensorboardX>=2.6.4",
     "setuptools>=68.0.0",
 ]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]

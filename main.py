@@ -1,5 +1,6 @@
 import csv
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import os
 from pathlib import Path
@@ -7,13 +8,13 @@ from subprocess import TimeoutExpired
 import threading
 import time
 
-import agent_arena
-from fight_starter import FightStartConfig, build_fight_start_lua
-import llm_arena
-from mame_launcher import open_sfiii3n
-from log_viewer import SplitLogWindow
-from screenshot_loop import create_snapshot_loop
-from tensorboard_logger import TensorboardRunLogger
+from src import agent_arena
+from src.fight_starter import FightStartConfig, build_fight_start_lua
+from src import llm_arena
+from src.mame_launcher import open_sfiii3n
+from src.log_viewer import SplitLogWindow
+from src.screenshot_loop import create_snapshot_loop
+from src.tensorboard_logger import TensorboardRunLogger
 
 
 ENABLE_LLM_ARENA = True
@@ -21,6 +22,10 @@ ENABLE_LOG_WINDOW = True
 ENABLE_TENSORBOARD = True
 CAPTURES_DIR = "captures"
 EXPERIMENT_MATCH_COUNT = 1
+# How many matches to run at the same time. Each parallel match launches its
+# own MAME process, its own Lua script, and its own set of LLM workers, so
+# all file paths are fully isolated. Set to 1 to restore sequential behaviour.
+PARALLEL_MATCH_COUNT = 1
 MATCH_MAX_SECONDS = 230.0
 AI_PLAYERS = (1, 2)
 FIGHT_MODE = "agent"
@@ -221,6 +226,7 @@ def _build_run_config(run_id: str, fight_start: FightStartConfig) -> dict[str, o
         "run_id": run_id,
         "fight_mode": FIGHT_MODE,
         "experiment_match_count": EXPERIMENT_MATCH_COUNT,
+        "parallel_match_count": PARALLEL_MATCH_COUNT,
         "match_max_seconds": MATCH_MAX_SECONDS,
         "ai_players": list(AI_PLAYERS),
         "use_on_demand_screenshots": USE_ON_DEMAND_SCREENSHOTS,
@@ -411,39 +417,65 @@ def main() -> None:
     summary_path = captures_root / "experiment_summary.csv"
     elo_path = captures_root / "elo_ratings.csv"
     elo_ratings: dict[str, float] = {}
+    # Protects elo_ratings dict and the two shared CSV/ELO files from
+    # concurrent writes when PARALLEL_MATCH_COUNT > 1.
+    results_lock = threading.Lock()
     captures_root.mkdir(parents=True, exist_ok=True)
     tensorboard_logger = TensorboardRunLogger(
         captures_root / "tensorboard",
         enabled=ENABLE_TENSORBOARD,
     )
+    parallel = max(1, PARALLEL_MATCH_COUNT)
     print(f"Starting experiment run: {captures_root}")
     print(f"Fight mode: {FIGHT_MODE}")
+    print(f"Parallel matches: {parallel}")
     print(f"TensorBoard: {tensorboard_logger.status_message}")
     if log_window is not None:
         log_window.log_status(f"Starting experiment run: {captures_root}")
-        log_window.log_status(f"Fight mode: {FIGHT_MODE}")
+        log_window.log_status(f"Fight mode: {FIGHT_MODE}  |  parallel: {parallel}")
         log_window.log_status(f"TensorBoard: {tensorboard_logger.status_message}")
     tensorboard_logger.log_run_config(_build_run_config(run_id, fight_start))
 
-    try:
-        for match_index in range(1, EXPERIMENT_MATCH_COUNT + 1):
-            match_dir = captures_root / f"match_{match_index:03d}"
-            row = _run_single_match(
-                match_index=match_index,
-                fight_start=fight_start,
-                match_dir=match_dir,
-                log_window=log_window,
-                tensorboard_logger=tensorboard_logger,
-            )
+    match_indices = list(range(1, EXPERIMENT_MATCH_COUNT + 1))
+
+    def _run_and_record(match_index: int) -> None:
+        match_dir = captures_root / f"match_{match_index:03d}"
+        row = _run_single_match(
+            match_index=match_index,
+            fight_start=fight_start,
+            match_dir=match_dir,
+            log_window=log_window,
+            tensorboard_logger=tensorboard_logger,
+        )
+        with results_lock:
             _apply_elo_update(ratings=elo_ratings, row=row)
             _append_experiment_summary(summary_path=summary_path, row=row)
             _write_elo_ratings(elo_path, elo_ratings)
             tensorboard_logger.log_match_row(match_index, row)
-            if log_window is not None:
-                log_window.log_status(
-                    f"Finished match {match_index}: "
-                    f"{row['status']} ({row['duration_seconds']}s)."
-                )
+        if log_window is not None:
+            log_window.log_status(
+                f"Finished match {match_index}: "
+                f"{row['status']} ({row['duration_seconds']}s)."
+            )
+
+    try:
+        with ThreadPoolExecutor(max_workers=parallel) as executor:
+            futures = {
+                executor.submit(_run_and_record, idx): idx
+                for idx in match_indices
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    future.result()
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:
+                    print(f"Match {idx} raised an unhandled exception: {exc}")
+                    if log_window is not None:
+                        log_window.log_status(f"Match {idx} failed: {exc}")
+                if log_window is not None:
+                    log_window.pump()
     except KeyboardInterrupt:
         if log_window is not None:
             log_window.log_status("Experiment interrupted.")
